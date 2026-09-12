@@ -97,6 +97,7 @@ foceiControl(
   outerTrustMterm = NULL,
   outerTrustRelStep = 0.001,
   outerTrustRestarts = 3L,
+  outerTrustCpp = TRUE,
   rhobeg = 0.2,
   rhoend = NULL,
   npt = NULL,
@@ -808,6 +809,12 @@ decrement there says the point is not stationary.  A collapsing trust
 region satisfies the solver's own convergence test at a point that is not
 a minimum; re-entering restores the initial radius.
 \code{maxOuterIterations} is the total across restarts, not per restart.}
+
+\item{outerTrustCpp}{When \code{TRUE} (the default) \code{outerOpt="trust"}
+is driven from C++ (\code{RcppTrust}'s \code{trust_solve_c}): objective,
+analytic gradient, outer Hessian and the solve-pool swaps between them run
+without returning to R between trial points.  \code{FALSE} uses the R
+driver with the same semantics.}
 
 \item{rhobeg}{Initial trust region radius for the bobyqa outer optimizer
 (with `rhoend`, must satisfy `0 < rhoend < rhobeg`). Default `0.2`

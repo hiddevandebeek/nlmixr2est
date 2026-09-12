@@ -204,4 +204,24 @@ test_that("outerOpt='trust' fits and consumes the analytic outer Hessian", {
                                outerOpt = "nlminb", fast = TRUE))
   expect_equal(fitA$objf, fitN$objf, tolerance = 1e-3)
   expect_equal(unname(fixef(fitA)), unname(fixef(fitN)), tolerance = 1e-2)
+  # The default driver is the C++ one (trust_solve_c drives objective, gradient,
+  # Hessian and the pool swaps with no R between trial points); the R driver is
+  # the same algorithm and must reproduce it -- same optimum, same path.
+  expect_identical(fitA$env$optReturn$driver, "C++")
+  fitR <- .nlmixr(model, d, "focei", ctl(fast = TRUE, outerTrustCpp = FALSE))
+  expect_null(fitR$env$optReturn$driver)
+  expect_equal(fitA$objf, fitR$objf, tolerance = 1e-6)
+  expect_equal(fitA$env$optReturn$iterations, fitR$env$optReturn$iterations)
+  expect_equal(fitA$env$optReturn$hessianEvaluations, fitR$env$optReturn$hessianEvaluations)
+  expect_equal(unname(fixef(fitA)), unname(fixef(fitR)), tolerance = 1e-5)
+  # the finite-difference curvature is the same settled difference on both sides
+  fitF <- .nlmixr(model, d, "focei", ctl(fast = TRUE, outerTrustHessian = "fd"))
+  fitFR <- .nlmixr(model, d, "focei", ctl(fast = TRUE, outerTrustHessian = "fd", outerTrustCpp = FALSE))
+  expect_equal(fitF$objf, fitFR$objf, tolerance = 1e-6)
+  expect_equal(fitF$env$optReturn$iterations, fitFR$env$optReturn$iterations)
+  # without fast= the analytic Hessian is unavailable and both drivers run on BFGS
+  fitB <- .nlmixr(model, d, "focei", ctl(fast = FALSE))
+  expect_identical(fitB$env$optReturn$driver, "C++")
+  expect_equal(fitB$env$optReturn$hessianEvaluations, 0L)
+  expect_equal(fitB$objf, fitA$objf, tolerance = 1e-3)
 })

@@ -539,6 +539,11 @@
 #'   Unsuccessful inner solves and an
 #'   active variance floor also make curvature unavailable.
 #'
+#' @param outerTrustCpp When \code{TRUE} (the default) \code{outerOpt="trust"}
+#'   is driven from C++ (\code{RcppTrust}'s \code{trust_solve_c}): objective,
+#'   analytic gradient, outer Hessian and the solve-pool swaps between them run
+#'   without returning to R between trial points.  \code{FALSE} uses the R
+#'   driver with the same semantics.
 #' @param innerOpt optimization method for the inner (per-subject eta)
 #'     problem: `"auto"` (default), `"trust"` (RcppTrust trust-region Newton,
 #'     using an exact Gauss-Newton+Omega^-1 Hessian every iteration) or
@@ -1190,6 +1195,7 @@ foceiControl <- function(sigdig = 3, #
                          outerTrustMterm = NULL, # NULL -> outerTrustFterm
                          outerTrustRelStep = 1e-3,
                          outerTrustRestarts = 3L,
+                         outerTrustCpp = TRUE,
                          ##
                          rhobeg = .2, #
                          rhoend = NULL, #
@@ -1721,6 +1727,7 @@ foceiControl <- function(sigdig = 3, #
     stop("'outerTrustRelStep' must be > 0", call. = FALSE)
   }
   checkmate::assertIntegerish(outerTrustRestarts, lower = 0, any.missing = FALSE, len = 1)
+  checkmate::assertFlag(outerTrustCpp)
   if (outerTrustHessian == "analytic" && .outerOptTxt == "trust" && !isTRUE(fast)) {
     stop("outerTrustHessian=\"analytic\" requires fast=TRUE", call. = FALSE)
   }
@@ -2021,6 +2028,7 @@ foceiControl <- function(sigdig = 3, #
     outerTrustMterm = outerTrustMterm,
     outerTrustRelStep = as.double(outerTrustRelStep),
     outerTrustRestarts = as.integer(outerTrustRestarts),
+    outerTrustCpp = outerTrustCpp,
     ## BFGS
     abstol = abstol,
     reltol = reltol,
