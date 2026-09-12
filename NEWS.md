@@ -311,6 +311,12 @@
 - Evaluated the conditional inner value, gradient and full curvature jointly
   in one pooled sensitivity solve, including M2/M3/M4 censoring.
 
+- `outerOpt="trust"` is driven from C++ (`RcppTrust`'s `trust_solve_c`, the way
+  `est="trust"` already is): the objective, the analytic gradient, the outer
+  Hessian and the solve-pool swaps between them run without returning to R
+  between trial points.  `foceiControl(outerTrustCpp=FALSE)` keeps the R driver,
+  which follows the same algorithm and reaches the same path.
+
 - Added `foceiControl(outerOpt="trust")`, a trust-region Newton outer optimizer
   (`RcppTrust`) driven by the analytical outer Hessian.  `outerTrustHessian=`
   selects the curvature -- the analytical Hessian under `fast=TRUE`, a damped
