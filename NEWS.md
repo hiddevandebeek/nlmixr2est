@@ -2,6 +2,11 @@
 
 ## Bug fixes
 
+- The analytic outer gradient takes Omega^-1 and its estimation-scale
+  derivatives from the native Cholesky map the objective already maintains
+  (verified against the R handle on first use, which stays the fallback), so
+  a gradient evaluation no longer calls the `rxSymInvChol` closure.
+
 - Swapping a peer model into the shared FOCEi solve pool (the augmented
   outer-gradient model for every analytic gradient, the outer Hessian's probes,
   the AGQ node model) installs its event-sensitivity shape from the registry
