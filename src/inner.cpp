@@ -10201,60 +10201,37 @@ extern "C" int foceiTrustObjfun(int n, const double *par, double *value,
   } catch (...) { return -4; }
 }
 
-// 0.5 g' H^-1 g, NA when H is not positive definite -- the decrease a full Newton
-// step from the reported point would still predict, compared against fterm
-static double foceiTrustDecrement(const arma::mat &H, const arma::vec &g) {
-  if (!H.is_finite() || !g.is_finite()) return NA_REAL;
-  arma::mat R;
-  if (!arma::chol(R, H)) return NA_REAL;
-  arma::vec z = arma::solve(arma::trimatl(R.t()), g);
-  return 0.5 * arma::dot(z, z);
-}
-
-static double ctlNum(List &ctl, const char *nm, double dflt) {
-  if (!ctl.containsElementNamed(nm)) return dflt;
-  RObject v = ctl[nm];
-  if (v.isNULL()) return dflt;
-  double d = as<double>(v);
-  return R_FINITE(d) ? d : dflt;
-}
-
+// The set-up and the verdict are the R driver's own helpers (.trustOuterMethod,
+// .trustOuterRegion, .trustOuterCount, .trustOuterDecrement, .trustOuterMessage),
+// called once each; only the trial points stay in C++.
 void foceiTrustOuter(Environment e) {
   FoceiTrustOuter &t = _trustOuter;
-  List ctl = as<List>(e["control"]);
+  Environment nlmixr2 = Environment::namespace_env("nlmixr2est");
+  List ctl = clone(as<List>(e["control"]));
+  ctl["hessian"] = nlmixr2["foceiOuterH"];
   int n = (int)op_focei.npars;
   t.n = n;
   t.lower.assign(op_focei.lower, op_focei.lower + n);
   t.upper.assign(op_focei.upper, op_focei.upper + n);
   t.qn = arma::eye(n, n); t.hasPrev = false; t.hessianCalls = 0; t.fallback = false;
-  t.relStep = ctlNum(ctl, "outerTrustRelStep", 1e-3);
-  // curvature source, as .trustOuterMethod(): fast= can still have been downgraded
-  std::string hm = ctl.containsElementNamed("outerTrustHessian") ? as<std::string>(ctl["outerTrustHessian"]) : "auto";
-  bool analyticOk = op_focei.fast != 0;
-  if (hm == "fd") t.method = 3;
-  else if (hm == "bfgs") t.method = 2;
-  else if (analyticOk) t.method = 1;
-  else {
-    if (hm == "analytic") Rf_warning("analytic outer Hessian needs fast=TRUE; trust uses BFGS");
-    t.method = 2;
-  }
-  std::vector<double> x(n);
+  t.relStep = ctl.containsElementNamed("outerTrustRelStep") && !Rf_isNull(ctl["outerTrustRelStep"]) ?
+    as<double>(ctl["outerTrustRelStep"]) : 1e-3;
+  std::string hm = as<std::string>(as<Function>(nlmixr2[".trustOuterMethod"])(ctl));
+  t.method = hm == "analytic" ? 1 : (hm == "fd" ? 3 : 2);
+  NumericVector x(n);
   for (int k = 0; k < n; ++k) x[k] = scalePar(op_focei.initPar, k);
-  // region and tolerances, as .trustOuterRegion()
-  double maxAbs = 0; for (int k = 0; k < n; ++k) maxAbs = std::max(maxAbs, std::fabs(x[k]));
-  double rinit = ctlNum(ctl, "outerTrustRinit", std::min(0.95, 0.2 * maxAbs));
-  if (!(rinit > 0)) rinit = 0.2;
-  double rmax = ctlNum(ctl, "outerTrustRmax", 8 * rinit);
-  double sigdig = ctlNum(ctl, "sigdig", 3);
-  double fterm = ctlNum(ctl, "outerTrustFterm", std::pow(10.0, -sigdig - 2));
-  double mterm = ctlNum(ctl, "outerTrustMterm", fterm);
-  int iterlim = std::max(1, (int)ctlNum(ctl, "maxOuterIterations", 1));
-  int restarts = std::max(0, (int)ctlNum(ctl, "outerTrustRestarts", 0));
+  List region = as<List>(as<Function>(nlmixr2[".trustOuterRegion"])(x, ctl));
+  double rinit = as<double>(region["rinit"]), rmax = as<double>(region["rmax"]);
+  double fterm = as<double>(region["fterm"]), mterm = as<double>(region["mterm"]);
+  Function count = as<Function>(nlmixr2[".trustOuterCount"]);
+  int iterlim = as<int>(count(ctl["maxOuterIterations"], 1L));
+  int restarts = as<int>(count(ctl["outerTrustRestarts"], 0L));
+  Function decrement = as<Function>(nlmixr2[".trustOuterDecrement"]);
   // run, re-entering while the region collapsed short of a stationary point
   int used = 0, left = iterlim, nRestart = 0;
   bool converged = false, under = false;
   double decr = NA_REAL, value = NA_REAL;
-  arma::vec arg(x), grad(n, arma::fill::value(NA_REAL));
+  arma::vec arg(x.begin(), n), grad(n, arma::fill::value(NA_REAL));
   arma::mat hess(n, n, arma::fill::value(NA_REAL));
   int err = 0;
   for (;;) {
@@ -10272,7 +10249,8 @@ void foceiTrustOuter(Environment e) {
       if (tres.hessian != NULL) hess = arma::mat(tres.hessian, n, n);
     }
     trust_result_free_ptr(&tres);
-    decr = foceiTrustDecrement(hess, grad);
+    decr = as<double>(decrement(List::create(_["hessian"] = wrap(hess),
+                                             _["gradient"] = NumericVector(grad.begin(), grad.end()))));
     under = ISNA(decr) || !R_FINITE(decr) || decr > fterm;
     bool again = under && converged && nRestart < restarts && left >= 1 &&
       arma::abs(arg - prev).max() > 0;
@@ -10280,8 +10258,6 @@ void foceiTrustOuter(Environment e) {
     nRestart++;
   }
   if (converged && under) Rf_warning("outer trust stopped short of a stationary point");
-  std::string msg = !converged ? "iteration limit reached without convergence (RcppTrust::trust)" :
-    (under ? "converged without a stationary point (RcppTrust::trust)" : "relative convergence (RcppTrust::trust)");
   NumericVector xr(arg.begin(), arg.end());
   if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0);
   foceiOuterFinal(xr.begin(), e);
@@ -10290,12 +10266,13 @@ void foceiTrustOuter(Environment e) {
                           _["hessian"] = wrap(hess), _["converged"] = converged,
                           _["iterations"] = used, _["restarts"] = nRestart,
                           _["newtonDecrement"] = decr, _["underConverged"] = under,
-                          _["convergence"] = converged ? 0 : 1, _["message"] = msg,
+                          _["convergence"] = converged ? 0 : 1,
                           _["hessianEvaluations"] = t.hessianCalls,
                           _["hessianFallback"] = t.fallback, _["error"] = err,
                           _["driver"] = "C++");
+  ret["message"] = as<Function>(nlmixr2[".trustOuterMessage"])(ret);
   e["convergence"] = ret["convergence"];
-  e["message"] = msg;
+  e["message"] = ret["message"];
   e["optReturn"] = ret;
 }
 
