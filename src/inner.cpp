@@ -31,6 +31,7 @@
 #include "scale.h"
 #include <n1qn1c.h>
 #include <RcppTrust.h>
+#include <R_ext/stats_stubs.h>
 #include <Rinternals.h>
 #ifdef _OPENMP
   #include <omp.h>
@@ -9884,18 +9885,21 @@ void foceiCustomFun(Environment e){
 }
 
 
-// ---- outerOpt="trust", driven from C++ ----------------------------------------------
+// ---- outer optimizers driven from C++ -------------------------------------------------
 //
-// RcppTrust's trust_solve_c() runs the whole outer loop here: objective, analytic
-// gradient, outer Hessian and every pool swap between them happen without returning
-// to R between trial points.
+// An optimizer with a C entry point (RcppTrust's trust_solve_c(), PORT's
+// nlminb_iterate() through the stats C API) runs its whole outer loop here:
+// objective, analytic gradient, outer Hessian and every pool swap between them happen
+// without returning to R between trial points.  The R-facing wrappers (.bobyqa,
+// .nlminb, ... in R/focei.R) remain the route for an optimizer that has no C entry
+// point and for a user-supplied outerOpt function (foceiCustomFun).
 //
-// Curvature: "analytic" (nlmixr2FoceiOuterHessian; a refusal demotes the run to
-// BFGS once, with a warning), "bfgs" (damped BFGS over consecutive CALLS -- trust
-// evaluates every trial point, accepted or not, and the secant equation holds for
-// any two evaluated points), or "fd" (a settled finite difference of the gradient).
-// The box is enforced by reporting an infeasible point, not by projecting.
-struct FoceiTrustOuter {
+// Curvature: "analytic" (nlmixr2FoceiOuterHessian), "bfgs" (damped BFGS over
+// consecutive CALLS -- trust evaluates every trial point, accepted or not, and the
+// secant equation holds for any two evaluated points), or "fd" (a settled finite
+// difference of the gradient).  The box is enforced by reporting an infeasible point,
+// not by projecting.
+struct FoceiOuterCpp {
   int n = 0, method = 0;          // method: 1 analytic, 2 bfgs, 3 fd
   double relStep = 1e-3;
   std::vector<double> lower, upper;
@@ -9928,12 +9932,46 @@ struct FoceiTrustOuter {
     h = 0.5 * (h + h.t());
     return true;
   }
+  // The analytic outer Hessian at x; false when it is refused at this point
+  bool analytic(const double *x, arma::mat &h) {
+    hessianCalls++;
+    h.set_size(n, n);
+    int st = nlmixr2FoceiOuterHessian(x, n, relStep, h.memptr());
+    return st == 0 && h.is_finite();
+  }
+  void reset(int npar, double step) {
+    n = npar; relStep = step;
+    lower.assign(op_focei.lower, op_focei.lower + n);
+    upper.assign(op_focei.upper, op_focei.upper + n);
+    qn = arma::eye(n, n); hasPrev = false; hessianCalls = 0; fallback = false;
+  }
+  NumericVector start() const {
+    NumericVector x(n);
+    for (int k = 0; k < n; ++k) x[k] = scalePar(op_focei.initPar, k);
+    return x;
+  }
 };
-static FoceiTrustOuter _trustOuter;
+static FoceiOuterCpp _outerCpp;
 
+static double foceiOuterCppRelStep(List &ctl) {
+  return ctl.containsElementNamed("outerTrustRelStep") && !Rf_isNull(ctl["outerTrustRelStep"]) ?
+    as<double>(ctl["outerTrustRelStep"]) : 1e-3;
+}
+
+// Finish like foceiCustomFun: final objective at x, then the optimizer's report
+static void foceiOuterCppFinal(Environment &e, NumericVector &x, List &ret) {
+  if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0);
+  foceiOuterFinal(x.begin(), e);
+  e["convergence"] = ret["convergence"];
+  e["message"] = ret["message"];
+  e["optReturn"] = ret;
+}
+
+// ---- outerOpt="trust" -----------------------------------------------------------------
+// An analytic refusal demotes the run to BFGS once, with a warning.
 extern "C" int foceiTrustObjfun(int n, const double *par, double *value,
                                 double *gradient, double *hessian, void *) {
-  FoceiTrustOuter &t = _trustOuter;
+  FoceiOuterCpp &t = _outerCpp;
   if (n != t.n) return -1;
   try {
     if (!t.box(par)) { *value = std::numeric_limits<double>::infinity(); return 1; }
@@ -9948,10 +9986,7 @@ extern "C" int foceiTrustObjfun(int n, const double *par, double *value,
     arma::mat h;
     bool have = false;
     if (t.method == 1) {
-      t.hessianCalls++;
-      h.set_size(n, n);
-      int st = nlmixr2FoceiOuterHessian(par, n, t.relStep, h.memptr());
-      if (st == 0 && h.is_finite()) have = true;
+      if (t.analytic(par, h)) have = true;
       else {
         // Refused at this point: the R driver demotes the whole run the same way
         t.fallback = true; t.method = 2;
@@ -9973,21 +10008,15 @@ extern "C" int foceiTrustObjfun(int n, const double *par, double *value,
 // .trustOuterCount, .trustOuterDecrement, .trustOuterMessage, R/focei.R), called
 // once each; only the trial points stay in C++.
 void foceiTrustOuter(Environment e) {
-  FoceiTrustOuter &t = _trustOuter;
+  FoceiOuterCpp &t = _outerCpp;
   Environment nlmixr2 = Environment::namespace_env("nlmixr2est");
   List ctl = clone(as<List>(e["control"]));
   ctl["hessian"] = nlmixr2["foceiOuterH"];
   int n = (int)op_focei.npars;
-  t.n = n;
-  t.lower.assign(op_focei.lower, op_focei.lower + n);
-  t.upper.assign(op_focei.upper, op_focei.upper + n);
-  t.qn = arma::eye(n, n); t.hasPrev = false; t.hessianCalls = 0; t.fallback = false;
-  t.relStep = ctl.containsElementNamed("outerTrustRelStep") && !Rf_isNull(ctl["outerTrustRelStep"]) ?
-    as<double>(ctl["outerTrustRelStep"]) : 1e-3;
+  t.reset(n, foceiOuterCppRelStep(ctl));
   std::string hm = as<std::string>(as<Function>(nlmixr2[".trustOuterMethod"])(ctl));
   t.method = hm == "analytic" ? 1 : (hm == "fd" ? 3 : 2);
-  NumericVector x(n);
-  for (int k = 0; k < n; ++k) x[k] = scalePar(op_focei.initPar, k);
+  NumericVector x = t.start();
   List region = as<List>(as<Function>(nlmixr2[".trustOuterRegion"])(x, ctl));
   double rinit = as<double>(region["rinit"]), rmax = as<double>(region["rmax"]);
   double fterm = as<double>(region["fterm"]), mterm = as<double>(region["mterm"]);
@@ -10027,8 +10056,6 @@ void foceiTrustOuter(Environment e) {
   }
   if (converged && under) Rf_warning("outer trust stopped short of a stationary point");
   NumericVector xr(arg.begin(), arg.end());
-  if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0);
-  foceiOuterFinal(xr.begin(), e);
   List ret = List::create(_["x"] = xr, _["par"] = xr, _["argument"] = xr, _["value"] = value,
                           _["gradient"] = NumericVector(grad.begin(), grad.end()),
                           _["hessian"] = wrap(hess), _["converged"] = converged,
@@ -10038,9 +10065,76 @@ void foceiTrustOuter(Environment e) {
                           _["hessianEvaluations"] = t.hessianCalls,
                           _["hessianFallback"] = t.fallback, _["error"] = err);
   ret["message"] = as<Function>(nlmixr2[".trustOuterMessage"])(ret);
-  e["convergence"] = ret["convergence"];
-  e["message"] = ret["message"];
-  e["optReturn"] = ret;
+  foceiOuterCppFinal(e, xr, ret);
+}
+
+// ---- outerOpt="nlminb" ------------------------------------------------------------------
+// PORT through the stats C API (nlminb_iterate / Rf_divset, R_ext/stats_stubs.h): the
+// same reverse-communication loop stats::nlminb()'s port_nlminb runs, with the same
+// iv/v control slots (eval.max, iter.max, rel.tol, x.tol) and the same report.  Under
+// fast=TRUE the analytic outer Hessian is supplied (PORT's drmnhb), as .nlminb()
+// does; a refusal restarts gradient-only from the start, as .nlminb() does.
+void foceiNlminbOuter(Environment e) {
+  FoceiOuterCpp &t = _outerCpp;
+  Environment nlmixr2 = Environment::namespace_env("nlmixr2est");
+  Environment stats = Environment::namespace_env("stats");
+  List ctl = as<List>(e["control"]);
+  int n = (int)op_focei.npars;
+  t.reset(n, foceiOuterCppRelStep(ctl));
+  bool useHessian = op_focei.fast != 0;
+  NumericVector x0 = t.start();
+  std::vector<double> b(2 * (size_t)n), d((size_t)n, 1.0), g((size_t)n), h((size_t)n * (n + 1) / 2);
+  for (int i = 0; i < n; ++i) { b[2 * i] = t.lower[i]; b[2 * i + 1] = t.upper[i]; }
+  int liv = 78 + 3 * n, lv = 130 + (n * (n + 27)) / 2;
+  std::vector<int> iv((size_t)liv);
+  std::vector<double> v((size_t)lv), x(x0.begin(), x0.end());
+  auto has = [&](const char *nm) { return ctl.containsElementNamed(nm) && !Rf_isNull(ctl[nm]); };
+  for (;;) {
+    std::fill(iv.begin(), iv.end(), 0); std::fill(v.begin(), v.end(), 0.0);
+    x.assign(x0.begin(), x0.end());
+    S_Rf_divset(2, iv.data(), liv, lv, v.data());
+    // 1-based PORT slots as stats::nlminb's port_cpos: iv[17] eval.max, iv[18]
+    // iter.max (maxOuterIterations, as .controlIterMax), iv[19] trace, v[32]
+    // rel.tol, v[33] x.tol; anything absent keeps divset's default, as nlminb()
+    if (has("eval.max")) iv[16] = as<int>(ctl["eval.max"]);
+    if (has("maxOuterIterations")) iv[17] = as<int>(ctl["maxOuterIterations"]);
+    else if (has("iter.max")) iv[17] = as<int>(ctl["iter.max"]);
+    iv[18] = 0;
+    if (has("rel.tol")) v[31] = as<double>(ctl["rel.tol"]);
+    if (has("x.tol")) v[32] = as<double>(ctl["x.tol"]);
+    double fx = R_PosInf;
+    bool refused = false;
+    do {
+      S_nlminb_iterate(b.data(), d.data(), fx, g.data(), useHessian ? h.data() : NULL,
+                       iv.data(), liv, lv, n, v.data(), x.data());
+      if (iv[0] == 2) {
+        outerGradNumOptim(n, x.data(), g.data(), NULL);
+        for (int i = 0; i < n; ++i) if (ISNAN(g[i])) stop("NA/NaN gradient evaluation");
+        if (useHessian) {
+          arma::mat H;
+          if (!t.analytic(x.data(), H)) { refused = true; break; }
+          for (int i = 0, pos = 0; i < n; ++i)
+            for (int j = 0; j <= i; ++j) h[pos++] = H(i, j);   // lower triangle, row-wise
+        }
+      } else {
+        fx = foceiOfvOptim(n, x.data(), NULL);
+        if (ISNAN(fx)) { Rf_warning("NA/NaN function evaluation"); fx = R_PosInf; }
+      }
+    } while (iv[0] < 3);
+    if (!refused) break;
+    t.fallback = true; useHessian = false;
+    Rf_warning("Outer Hessian unavailable; restarting gradient-only nlminb");
+  }
+  int iv1 = iv[0];
+  NumericVector xr(x.begin(), x.end());
+  List ret = List::create(_["par"] = xr, _["x"] = xr, _["objective"] = v[9],
+                          _["convergence"] = (iv1 >= 3 && iv1 <= 6) ? 0 : 1,
+                          _["iterations"] = iv[30],
+                          _["evaluations"] = IntegerVector::create(_["function"] = iv[5], _["gradient"] = iv[29]),
+                          _["message"] = as<Function>(stats["port_msg"])(iv1),
+                          _["hessianEvaluations"] = t.hessianCalls,
+                          _["hessianFallback"] = t.fallback);
+  foceiOuterCppFinal(e, xr, ret);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -10123,6 +10217,9 @@ Environment foceiOuter(Environment e){
       break;
     case -2:
       foceiTrustOuter(e);
+      break;
+    case -3:
+      foceiNlminbOuter(e);
       break;
     }
     op_foceiUseAnalyticGrad = false;

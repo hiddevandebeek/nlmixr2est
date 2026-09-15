@@ -37,3 +37,30 @@ test_that("built-in nlminb automatically uses supported outer curvature", {
   expect_identical(fallback$env$optReturn$hessianEvaluations, 1L)
   expect_true(is.finite(fallback$objf))
 })
+
+test_that("the C++ nlminb driver reproduces stats::nlminb's path", {
+  skip_on_cran()
+  model <- function() {
+    ini({ level <- 0.2; error <- fix(0.2); etaLevel ~ 0.2 })
+    model({ prediction <- exp(level+etaLevel); prediction ~ prop(error) })
+  }
+  data <- data.frame(ID = rep(1:6, each = 3), TIME = rep(1:3, 6),
+    DV = c(1.5, 1.7, 1.6, 0.8, 1, 1.1, 1.1, 1.2, 1, 2, 2.1, 1.9,
+           0.9, 0.8, 0.7, 1.5, 1.3, 1.4), AMT = 0, EVID = 0)
+  control <- foceiControl(fast = TRUE, outerOpt = "nlminb", print = 0,
+    covMethod = "", calcTables = FALSE, compress = FALSE)
+  expect_identical(control$outerOpt, -3L)
+  expect_null(control$outerOptFun)
+  # a round-tripped control keeps the C++ code
+  expect_identical(do.call(foceiControl, unclass(control))$outerOpt, -3L)
+  fit <- .nlmixr(model, data, "focei", control = control)
+  # the same PORT loop through the R wrapper (stats::nlminb with .nlminb's controls)
+  control$outerOpt <- -1L; control$outerOptFun <- .nlminb
+  reference <- .nlmixr(model, data, "focei", control = control)
+  for (field in c("objective", "iterations", "evaluations", "convergence", "message",
+                  "hessianEvaluations", "hessianFallback")) {
+    expect_equal(fit$env$optReturn[[field]], reference$env$optReturn[[field]], info = field)
+  }
+  expect_equal(fit$objf, reference$objf, tolerance = 1e-10)
+  expect_equal(fit$theta, reference$theta, tolerance = 1e-10)
+})

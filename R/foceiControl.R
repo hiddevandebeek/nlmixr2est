@@ -495,6 +495,10 @@
 #'   (\pkg{RcppTrust}) built on that same Hessian; see
 #'   \code{outerTrustHessian}.  It is unbounded, so a trial point outside the
 #'   box is reported as an infinite objective and the region shrinks instead.
+#'   \code{"nlminb"}, \code{"trust"}, \code{"lbfgsb3c"} and \code{"L-BFGS-B"}
+#'   are driven from C++ (objective, gradient, Hessian and the solve-pool swaps
+#'   run without returning to R between trial points); the remaining optimizers
+#'   and a user-supplied function are called through R.
 #'
 #' @param outerTrustHessian Curvature source for \code{outerOpt="trust"}.
 #'   \code{"auto"} (default) uses the analytical outer Hessian when
@@ -1641,8 +1645,8 @@ foceiControl <- function(sigdig = 3, #
       outerOptFun <- .bobyqa
       outerOpt <- -1L
     } else if (outerOpt == "nlminb") {
-      outerOptFun <- .nlminb
-      outerOpt <- -1L
+      # driven from C++ (foceiNlminbOuter), not through outerOptFun
+      outerOpt <- -3L
     } else if (outerOpt == "mma") {
       outerOptFun <- .nloptr
       outerOpt <- -1L
@@ -1678,8 +1682,10 @@ foceiControl <- function(sigdig = 3, #
     outerOptFun <- outerOpt
     outerOpt <- -1L
   } else if (identical(.outerOptTxt, "trust")) {
-    # a round-tripped control: trust has no outerOptFun, only its code
+    # a round-tripped control: the C++-driven optimizers have no outerOptFun
     outerOpt <- -2L
+  } else if (identical(.outerOptTxt, "nlminb")) {
+    outerOpt <- -3L
   }
   # A derivative-free outer optimizer never consumes the analytic 'fast' gradient,
   # so computing it is wasted work: downgrade to fast=FALSE with a warning.

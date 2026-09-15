@@ -32,7 +32,7 @@ nmTest({
     expect_true(foceiControl(fast = TRUE)$fast)
     expect_false(foceiControl()$fast)
     # an explicit outerOpt still wins under fast
-    expect_equal(foceiControl(fast = TRUE, outerOpt = "nlminb")$outerOpt, -1L)
+    expect_equal(foceiControl(fast = TRUE, outerOpt = "nlminb")$outerOpt, -3L)  # C++ nlminb
     # a defaulted optimizer re-defaults under a *f wrapper; an explicit one is kept
     expect_equal(nlmixr2est:::.foceiFastCtl(list(foceiControl()), foceiControl)$outerOptTxt,
                  "lbfgsb3c")

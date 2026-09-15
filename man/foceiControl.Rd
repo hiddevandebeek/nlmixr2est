@@ -681,7 +681,11 @@ for supported Gaussian FOCE/FOCE+/FOCEI/AGQ models, restarting with gradients on
 curvature is unavailable.  \code{"trust"} is a trust-region Newton method
 (\pkg{RcppTrust}) built on that same Hessian; see
 \code{outerTrustHessian}.  It is unbounded, so a trial point outside the
-box is reported as an infinite objective and the region shrinks instead.}
+box is reported as an infinite objective and the region shrinks instead.
+\code{"nlminb"}, \code{"trust"}, \code{"lbfgsb3c"} and \code{"L-BFGS-B"}
+are driven from C++ (objective, gradient, Hessian and the solve-pool swaps
+run without returning to R between trial points); the remaining optimizers
+and a user-supplied function are called through R.}
 
 \item{innerOpt}{optimization method for the inner (per-subject eta)
     problem: `"auto"` (default), `"trust"` (RcppTrust trust-region Newton,

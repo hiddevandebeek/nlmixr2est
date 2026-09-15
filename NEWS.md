@@ -112,6 +112,13 @@
 - Evaluated the conditional inner value, gradient and full curvature jointly
   in one pooled sensitivity solve, including M2/M3/M4 censoring.
 
+- `outerOpt="nlminb"` is driven from C++ through PORT's `nlminb_iterate` (the
+  `stats` C API), the same reverse-communication loop `stats::nlminb()` runs,
+  with the same controls and report; it reproduces the R route's path exactly.
+  Like `"trust"`, `"lbfgsb3c"` and `"L-BFGS-B"`, the objective, gradient, outer
+  Hessian and the solve-pool swaps between them now run without returning to R
+  between trial points.
+
 - Added `foceiControl(outerOpt="trust")`, a trust-region Newton outer optimizer
   (`RcppTrust`'s `trust_solve_c`, run from C++ the way `est="trust"` is: the
   objective, the analytic gradient, the outer Hessian and the solve-pool swaps
