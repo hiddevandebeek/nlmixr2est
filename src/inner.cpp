@@ -9888,8 +9888,7 @@ void foceiCustomFun(Environment e){
 //
 // RcppTrust's trust_solve_c() runs the whole outer loop here: objective, analytic
 // gradient, outer Hessian and every pool swap between them happen without returning
-// to R between trial points.  The R driver (.trustOuter, R/focei.R) keeps the same
-// semantics and stays available through foceiControl(outerTrustCpp = FALSE).
+// to R between trial points.
 //
 // Curvature: "analytic" (nlmixr2FoceiOuterHessian; a refusal demotes the run to
 // BFGS once, with a warning), "bfgs" (damped BFGS over consecutive CALLS -- trust
@@ -9970,9 +9969,9 @@ extern "C" int foceiTrustObjfun(int n, const double *par, double *value,
   } catch (...) { return -4; }
 }
 
-// The set-up and the verdict are the R driver's own helpers (.trustOuterMethod,
-// .trustOuterRegion, .trustOuterCount, .trustOuterDecrement, .trustOuterMessage),
-// called once each; only the trial points stay in C++.
+// The set-up and the verdict are R helpers (.trustOuterMethod, .trustOuterRegion,
+// .trustOuterCount, .trustOuterDecrement, .trustOuterMessage, R/focei.R), called
+// once each; only the trial points stay in C++.
 void foceiTrustOuter(Environment e) {
   FoceiTrustOuter &t = _trustOuter;
   Environment nlmixr2 = Environment::namespace_env("nlmixr2est");
@@ -10037,8 +10036,7 @@ void foceiTrustOuter(Environment e) {
                           _["newtonDecrement"] = decr, _["underConverged"] = under,
                           _["convergence"] = converged ? 0 : 1,
                           _["hessianEvaluations"] = t.hessianCalls,
-                          _["hessianFallback"] = t.fallback, _["error"] = err,
-                          _["driver"] = "C++");
+                          _["hessianFallback"] = t.fallback, _["error"] = err);
   ret["message"] = as<Function>(nlmixr2[".trustOuterMessage"])(ret);
   e["convergence"] = ret["convergence"];
   e["message"] = ret["message"];
@@ -10120,15 +10118,12 @@ Environment foceiOuter(Environment e){
     case 1:
       foceiLbfgsb3(e);
       break;
-    case -1: {
-      // outerOpt="trust" runs in C++ unless the R driver is asked for explicitly
-      List _ctl = as<List>(e["control"]);
-      bool _trust = _ctl.containsElementNamed("outerOptTxt") &&
-        as<std::string>(_ctl["outerOptTxt"]) == "trust";
-      bool _cpp = !_ctl.containsElementNamed("outerTrustCpp") || as<bool>(_ctl["outerTrustCpp"]);
-      if (_trust && _cpp) foceiTrustOuter(e); else foceiCustomFun(e);
+    case -1:
+      foceiCustomFun(e);
       break;
-    }
+    case -2:
+      foceiTrustOuter(e);
+      break;
     }
     op_foceiUseAnalyticGrad = false;
   } else {
