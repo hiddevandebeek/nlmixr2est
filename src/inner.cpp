@@ -10069,6 +10069,26 @@ void foceiTrustOuter(Environment e) {
 }
 
 // ---- outerOpt="nlminb" ------------------------------------------------------------------
+// stats::nlminb()'s port_msg (unexported): PORT's iv[1] return code as text
+static std::string foceiNlminbMessage(int iv1) {
+  switch (iv1) {
+  case 3: return "X-convergence (3)";
+  case 4: return "relative convergence (4)";
+  case 5: return "both X-convergence and relative convergence (5)";
+  case 6: return "absolute function convergence (6)";
+  case 7: return "singular convergence (7)";
+  case 8: return "false convergence (8)";
+  case 9: return "function evaluation limit reached without convergence (9)";
+  case 10: return "iteration limit reached without convergence (10)";
+  case 14: return "storage only has been allocated (14)";
+  case 15: return "LIV too small (15)";
+  case 16: return "LV too small (16)";
+  case 63: return "fn cannot be computed at initial par (63)";
+  case 65: return "gr cannot be computed at initial par (65)";
+  case 300: return "initial par violates constraints";
+  default: return "See PORT documentation.  Code (" + std::to_string(iv1) + ")";
+  }
+}
 // PORT through the stats C API (nlminb_iterate / Rf_divset, R_ext/stats_stubs.h): the
 // same reverse-communication loop stats::nlminb()'s port_nlminb runs, with the same
 // iv/v control slots (eval.max, iter.max, rel.tol, x.tol) and the same report.  Under
@@ -10076,8 +10096,6 @@ void foceiTrustOuter(Environment e) {
 // does; a refusal restarts gradient-only from the start, as .nlminb() does.
 void foceiNlminbOuter(Environment e) {
   FoceiOuterCpp &t = _outerCpp;
-  Environment nlmixr2 = Environment::namespace_env("nlmixr2est");
-  Environment stats = Environment::namespace_env("stats");
   List ctl = as<List>(e["control"]);
   int n = (int)op_focei.npars;
   t.reset(n, foceiOuterCppRelStep(ctl));
@@ -10131,7 +10149,7 @@ void foceiNlminbOuter(Environment e) {
                           _["convergence"] = (iv1 >= 3 && iv1 <= 6) ? 0 : 1,
                           _["iterations"] = iv[30],
                           _["evaluations"] = IntegerVector::create(_["function"] = iv[5], _["gradient"] = iv[29]),
-                          _["message"] = as<Function>(stats["port_msg"])(iv1),
+                          _["message"] = foceiNlminbMessage(iv1),
                           _["hessianEvaluations"] = t.hessianCalls,
                           _["hessianFallback"] = t.fallback);
   foceiOuterCppFinal(e, xr, ret);
