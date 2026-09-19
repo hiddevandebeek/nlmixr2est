@@ -356,6 +356,20 @@
   the one-compartment ODE): 116.807191 against `outerOpt="nlminb"`'s 116.808709,
   at comparable cost once the model cache is warm.
 
+- `outerOpt="trust"` is driven from C++ (`RcppTrust`'s `trust_solve_c`, the way
+  `est="trust"` already is): the objective, the analytic gradient, the outer
+  Hessian and the solve-pool swaps between them run without returning to R
+  between trial points.  The driver evaluates the gradient and Hessian only
+  at points the trust region can accept (a trial that is no improvement gets
+  its value alone, 1.1x-2.6x faster with the analytical Hessian on perturbed
+  starts), and it holds a coordinate on its bound when the model's step keeps
+  leaving the box there, releasing it when the gradient pulls it back inside.
+  Rejecting those trials alone converged linearly onto the bound and could
+  stop there short of the optimum (two of nine perturbed-start fits measured
+  ended 154 and 141 objective units above the optimum the bounded L-BFGS-B
+  and `nlminb` reach; both now reach it).  `$optReturn$activeBounds` lists
+  the coordinates held at the end.
+
 - Added `est="flaplace"`, `"mflaplace"`, `"iflaplace"`, `"fagq"`, `"mfagq"` and
   `"ifagq"` -- the Laplace and adaptive-quadrature methods (plus their
   mu-referenced `"lin"`/`"irls"` variants) run with the full conditional

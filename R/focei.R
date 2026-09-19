@@ -305,97 +305,6 @@ is.latex <- function() {
   .ret
 }
 
-#' Damped-BFGS curvature for the outer trust region
-#'
-#' Returns the updater.  `trust_solve_c()` calls the objective at every TRIAL
-#' point, accepted or not, so the secant pair is consecutive CALLS -- the same
-#' convention `nlmTrustObjfun()` uses for the analogous outer problem
-#' (`src/nlm.cpp`).
-#' @param n number of parameters
-#' @return function(x, gradient) returning the current Hessian estimate
-#' @noRd
-.trustOuterBfgs <- function(n) {
-  .b <- diag(n)
-  .xPrev <- NULL
-  .gPrev <- NULL
-  function(x, g) {
-    if (!is.null(.xPrev)) {
-      .s <- x - .xPrev
-      .y <- g - .gPrev
-      .bs <- drop(.b %*% .s)
-      .sBs <- sum(.s * .bs)
-      .sy <- sum(.s * .y)
-      if (is.finite(.sBs) && .sBs > 0 && all(is.finite(.y))) {
-        # Damped BFGS (Nocedal & Wright, Numerical Optimization 2nd ed,
-        # Procedure 18.2): keeps the update positive definite when the outer
-        # objective's curvature along s is not.
-        .r <- if (.sy >= 0.2 * .sBs) {
-          .y
-        } else {
-          .th <- 0.8 * .sBs / (.sBs - .sy)
-          .th * .y + (1 - .th) * .bs
-        }
-        .sr <- sum(.s * .r)
-        # Same near-zero-denominator skip as trustHessianUpdate() (src/
-        # trustHessianUpdate.h): a reject-then-shrink step gives a secant pair
-        # whose rank-2 correction is enormous and meaningless.
-        if (
-          is.finite(.sr) &&
-            .sr > 1e-10 * sqrt(sum(.s^2)) * sqrt(sum(.r^2))
-        ) {
-          .b <<- .b - outer(.bs, .bs) / .sBs + outer(.r, .r) / .sr
-        }
-      }
-    }
-    .xPrev <<- x
-    .gPrev <<- g
-    .b
-  }
-}
-
-#' Finite-difference curvature for the outer trust region
-#'
-#' Differences the outer gradient, costing `length(lower)` extra population
-#' objective+gradient evaluations per call -- which is why it is not the default
-#' when the analytic Hessian is available.  A direction is reflected at an upper
-#' bound and the whole Hessian declined (`NULL`) when neither side fits in the
-#' box; the point is re-settled on the way out, so the supplier leaves the
-#' engine where it found it just as the analytic entry does.
-#'
-#' `fn` before every `gr` is load bearing, not defensive: the gradient callback
-#' warm-starts the inner problem from whatever etas the last evaluation left, so
-#' reading it at a point the objective has not settled returns a gradient at a
-#' stale conditional mode.  Measured on `theo_sd`, the two differ by ~9e-4 on
-#' gradient components of order 200 -- which a 1e-3 difference step turns into
-#' an O(1) error in the Hessian entries.
-#' @param fn,gr outer objective and gradient
-#' @param relStep relative difference step
-#' @param lower,upper box the outer problem optimizes in
-#' @return function(x, gradient) returning a symmetric Hessian, or `NULL`
-#' @noRd
-.trustOuterFd <- function(fn, gr, relStep, lower, upper) {
-  .n <- length(lower)
-  function(x, g0) {
-    .h <- matrix(0.0, .n, .n)
-    for (.j in seq_len(.n)) {
-      .step <- relStep * max(abs(x[.j]), 1.0)
-      if (x[.j] + .step > upper[.j]) {
-        .step <- -.step
-      }
-      if (x[.j] + .step < lower[.j]) {
-        fn(x)
-        return(NULL)
-      }
-      .xp <- x
-      .xp[.j] <- x[.j] + .step
-      fn(.xp)
-      .h[, .j] <- (gr(.xp) - g0) / .step
-    }
-    fn(x)
-    0.5 * (.h + t(.h))
-  }
-}
-
 #' Resolve the trust region's radii and tolerances
 #'
 #' `rinit` mirrors `minqa::bobyqa()`'s own default-rhobeg formula so swapping
@@ -455,60 +364,6 @@ is.latex <- function() {
   0.5 * sum(backsolve(.ch, .g, transpose = TRUE)^2)
 }
 
-#' Run the outer trust region, re-entering it while it stops short
-#'
-#' `trust_solve_c()` reports `converged=TRUE` off its own step/model tolerance,
-#' which a collapsing trust region satisfies at a point that is not stationary
-#' at all (measured: a fit exited at 133.34 whose full Newton step still
-#' predicted a 530 decrease).  Re-entering from that point restores the initial
-#' radius, which is what lets it move again.
-#' @param objfun the value/gradient/hessian function
-#' @param par starting vector
-#' @param region `.trustOuterRegion()` output
-#' @param iterlim TOTAL iteration budget, across restarts
-#' @param restarts maximum number of re-entries
-#' @return the `RcppTrust::trust()` result, with `iterations` totalled and
-#'   `restarts`, `newtonDecrement` and `underConverged` added
-#' @noRd
-.trustOuterRun <- function(objfun, par, region, iterlim, restarts) {
-  .x <- par
-  .left <- iterlim
-  .used <- 0L
-  .nRestart <- 0L
-  repeat {
-    .ret <- RcppTrust::trust(
-      objfun,
-      parinit = .x,
-      rinit = region$rinit,
-      rmax = region$rmax,
-      iterlim = .left,
-      fterm = region$fterm,
-      mterm = region$mterm,
-      minimize = TRUE,
-      blather = FALSE
-    )
-    .used <- .used + .ret$iterations
-    .left <- .left - .ret$iterations
-    .decr <- .trustOuterDecrement(.ret)
-    .under <- is.na(.decr) || .decr > region$fterm
-    .again <- .under &&
-      isTRUE(.ret$converged) &&
-      .nRestart < restarts &&
-      .left >= 1L &&
-      max(abs(.ret$argument - .x)) > 0
-    if (!.again) {
-      break
-    }
-    .x <- .ret$argument
-    .nRestart <- .nRestart + 1L
-  }
-  .ret$iterations <- .used
-  .ret$restarts <- .nRestart
-  .ret$newtonDecrement <- .decr
-  .ret$underConverged <- .under
-  .ret
-}
-
 #' Which curvature source `outerOpt="trust"` starts from
 #'
 #' `fast=` is not settled when `foceiControl()` validates it -- a `linCmt()`
@@ -534,120 +389,6 @@ is.latex <- function() {
   .method
 }
 
-#' Curvature supplier for `outerOpt="trust"`
-#'
-#' Serves the requested source and falls back to the damped-BFGS update when it
-#' cannot answer.  Support for the analytic Hessian is a property of the model,
-#' not of the point, so one refusal switches the run for good rather than paying
-#' the failed probe again every iteration.
-#' The BFGS update runs on every call whatever source serves it, so its secant
-#' pairs stay consecutive and the fallback starts from a matrix that already
-#' knows the problem rather than the identity.
-#' @param control the foceiControl list
-#' @param fn,gr outer objective and gradient
-#' @param relStep relative step, for both the analytic entry and the difference
-#' @param lower,upper box the outer problem optimizes in
-#' @return environment with `hessian(x, gradient)`, `calls` and `fallback`
-#' @noRd
-.trustOuterCurvature <- function(control, fn, gr, relStep, lower, upper) {
-  .method <- .trustOuterMethod(control)
-  .bfgs <- .trustOuterBfgs(length(lower))
-  .fd <- .trustOuterFd(fn, gr, relStep, lower, upper)
-  .state <- new.env(parent = emptyenv())
-  .state$calls <- 0L
-  .state$fallback <- FALSE
-  .state$hessian <- function(x, g) {
-    .qn <- .bfgs(x, g)
-    .h <- NULL
-    if (.method == "analytic") {
-      .state$calls <- .state$calls + 1L
-      .h <- tryCatch(control$hessian(x, relStep = relStep), error = function(e) {
-        .state$fallback <- TRUE
-        .method <<- "bfgs"
-        warning("analytic outer Hessian unavailable; trust continues with BFGS", call. = FALSE)
-        NULL
-      })
-    } else if (.method == "fd") {
-      .h <- .fd(x, g)
-    }
-    if (is.null(.h)) {
-      .h <- .qn
-    }
-    .h
-  }
-  .state
-}
-
-#' The value/gradient/Hessian function `RcppTrust::trust()` calls
-#'
-#' `trust` is unbounded, so a point outside the box -- or one the inner problem
-#' could not evaluate -- is reported as an infinite objective: the region
-#' shrinks rather than the step being projected, and the analytic Hessian
-#' (which refuses an out-of-bounds theta) is never asked for one.
-#' @param fn,gr outer objective and gradient
-#' @param curvature `.trustOuterCurvature()` output
-#' @param lower,upper box the outer problem optimizes in
-#' @return function(x) returning `list(value=, gradient=, hessian=)`
-#' @noRd
-.trustOuterObjfun <- function(fn, gr, curvature, lower, upper) {
-  .n <- length(lower)
-  .reject <- list(value = Inf, gradient = rep(0.0, .n), hessian = diag(.n))
-  function(x) {
-    if (any(x < lower) || any(x > upper)) {
-      return(.reject)
-    }
-    .v <- fn(x)
-    if (!is.finite(.v)) {
-      return(.reject)
-    }
-    .g <- gr(x)
-    if (length(.g) != .n || !all(is.finite(.g))) {
-      return(.reject)
-    }
-    .h <- curvature$hessian(x, .g)
-    if (is.null(.h) || !all(is.finite(.h))) {
-      return(.reject)
-    }
-    list(value = .v, gradient = .g, hessian = .h)
-  }
-}
-
-#' Trust-region Newton outer optimizer (`outerOpt="trust"`)
-#'
-#' Drives the outer (population theta) problem with `RcppTrust`'s port of
-#' Geyer's trust-region algorithm, using the analytic outer Hessian when
-#' `fast=TRUE` makes it available (see `outerTrustHessian`).
-#' @noRd
-.trustOuter <- function(par, fn, gr, lower = -Inf, upper = Inf, control = list(), ...) {
-  rxode2::rxReq("RcppTrust")
-  .n <- length(par)
-  .lower <- rep_len(lower, .n)
-  .upper <- rep_len(upper, .n)
-  .relStep <- control$outerTrustRelStep
-  if (is.null(.relStep)) {
-    .relStep <- 1e-3
-  }
-  .curvature <- .trustOuterCurvature(control, fn, gr, .relStep, .lower, .upper)
-  .ret <- .trustOuterRun(
-    .trustOuterObjfun(fn, gr, .curvature, .lower, .upper),
-    par,
-    .trustOuterRegion(par, control),
-    .trustOuterCount(control$maxOuterIterations, 1L),
-    .trustOuterCount(control$outerTrustRestarts, 0L)
-  )
-  if (isTRUE(.ret$converged) && .ret$underConverged) {
-    warning("outer trust stopped short of a stationary point", call. = FALSE)
-  }
-  .ret$x <- .ret$argument
-  .ret$par <- .ret$argument
-  # trust reports convergence as a logical; focei expects optim()'s 0/1.
-  .ret$convergence <- if (isTRUE(.ret$converged)) 0L else 1L
-  .ret$message <- .trustOuterMessage(.ret)
-  .ret$hessianEvaluations <- .curvature$calls
-  .ret$hessianFallback <- .curvature$fallback
-  .ret
-}
-
 #' A non-negative integer control value, or its floor
 #' @param value the control value
 #' @param floor the smallest value the caller can use
@@ -659,7 +400,7 @@ is.latex <- function() {
 }
 
 #' Translate a trust result into focei's minimization message
-#' @param ret `.trustOuterRun()` output
+#' @param ret the C++ driver's result list (`foceiTrustOuter`)
 #' @return the message string
 #' @noRd
 .trustOuterMessage <- function(ret) {

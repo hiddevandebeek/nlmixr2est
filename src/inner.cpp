@@ -10115,6 +10115,280 @@ void foceiCustomFun(Environment e){
 }
 
 
+// ---- outerOpt="trust", driven from C++ ----------------------------------------------
+//
+// RcppTrust's trust_solve_c() runs the whole outer loop here: objective, analytic
+// gradient, outer Hessian and every pool swap between them happen without returning
+// to R between trial points.
+//
+// Curvature: "analytic" (nlmixr2FoceiOuterHessian; a refusal demotes the run to
+// BFGS once, with a warning), "bfgs" (damped BFGS over consecutive evaluated points),
+// or "fd" (a settled finite difference of the gradient).
+//
+// Trust reads the gradient and Hessian only at points it accepts, and it can only
+// accept a value below the incumbent's, so a trial that is no improvement gets its
+// value only -- the Hessian is the expensive part of an iteration.  The incumbent is
+// tracked by replaying trust's own acceptance test.
+//
+// Bounds: trust is unbounded.  A trial outside the box is reported infeasible, which
+// shrinks the region; on its own that converges only linearly onto an active bound
+// (every Newton step points outside, so every iteration is region-limited).  So when
+// the model's Newton step from an accepted point leaves the box in a coordinate, that
+// coordinate is snapped onto its bound and held there (the model trust sees is masked
+// so the step in it is exactly zero), and trust restarts on the free coordinates.  A
+// held coordinate is released when the gradient at a converged point pulls it back
+// inside.
+struct FoceiTrustOuter {
+  int n = 0, method = 0;          // method: 1 analytic, 2 bfgs, 3 fd
+  double relStep = 1e-3;
+  double fterm = 0, mterm = 0;
+  std::vector<double> lower, upper;
+  arma::mat qn;                   // running quasi-Newton estimate
+  arma::vec xPrev, gPrev; bool hasPrev = false;
+  int hessianCalls = 0; bool fallback = false;
+  // incumbent: the unmasked gradient/Hessian, and the masked pair trust was given
+  bool hasInc = false; double incValue = 0;
+  arma::vec incX, incG, incGm; arma::mat incH, incHm;
+  // active set
+  std::vector<char> held;         // coordinate held on a bound
+  std::vector<double> heldAt;
+  bool snapPending = false;       // a coordinate was just marked: abort trust and restart
+  int activeChanges = 0, infeasibleRun = 0;
+
+  bool box(const double *x) const {
+    for (int j = 0; j < n; ++j) if (!held[j] && (x[j] < lower[j] || x[j] > upper[j])) return false;
+    return true;
+  }
+  // The model's step from the incumbent leaves the box in these coordinates.  One
+  // exit can be the initial region; a second, after the region shrank, is the model
+  // wanting out: hold them.
+  bool markExits(const double *x) {
+    if (!hasInc || ++infeasibleRun < 2) return false;
+    bool any = false;
+    for (int j = 0; j < n; ++j) {
+      if (held[j]) continue;
+      if (x[j] < lower[j]) { held[j] = 1; heldAt[j] = lower[j]; any = true; }
+      else if (x[j] > upper[j]) { held[j] = 1; heldAt[j] = upper[j]; any = true; }
+    }
+    return any;
+  }
+  void clamp(arma::vec &x) const {
+    for (int j = 0; j < n; ++j) if (held[j]) x[j] = heldAt[j];
+  }
+  void mask(const arma::vec &g, const arma::mat &h, arma::vec &gm, arma::mat &hm) const {
+    gm = g; hm = h;
+    for (int j = 0; j < n; ++j) if (held[j]) {
+      gm[j] = 0; hm.row(j).zeros(); hm.col(j).zeros(); hm(j, j) = 1.0;
+    }
+  }
+  // trust's own test (same preddiff, rho, fterm/mterm; no parscale, minimize)
+  bool accepts(const arma::vec &x, double v) const {
+    if (!hasInc) return true;
+    arma::vec p = x - incX;
+    double pred = arma::dot(p, incGm + 0.5 * (incHm * p));
+    bool term = std::fabs(v - incValue) < fterm || std::fabs(pred) < mterm;
+    if (term) return v < incValue;
+    return std::isfinite(pred) && pred != 0 && (v - incValue) / pred > 0.25;
+  }
+  // gradient pulls a held coordinate back inside: release it
+  bool release() {
+    bool any = false;
+    for (int j = 0; j < n; ++j) if (held[j]) {
+      bool inward = heldAt[j] == lower[j] ? incG[j] < 0 : incG[j] > 0;
+      if (inward) { held[j] = 0; any = true; }
+    }
+    if (any) mask(incG, incH, incGm, incHm);
+    return any;
+  }
+  void secant(const arma::vec &x, const arma::vec &g) {
+    if (hasPrev) trustHessianUpdate(trustHessBfgs, qn, x - xPrev, g - gPrev);
+    xPrev = x; gPrev = g; hasPrev = true;
+  }
+  // Finite difference of the settled gradient; false when the box leaves no room
+  bool fd(const arma::vec &x, const arma::vec &g0, arma::mat &h) {
+    h.zeros(n, n);
+    std::vector<double> xp(x.begin(), x.end()), gp(n);
+    for (int j = 0; j < n; ++j) {
+      double step = relStep * std::max(std::fabs(x[j]), 1.0);
+      if (x[j] + step > upper[j]) step = -step;
+      if (x[j] + step < lower[j]) { std::vector<double> x0(x.begin(), x.end()); foceiOfvOptim(n, x0.data(), NULL); return false; }
+      xp[j] = x[j] + step;
+      foceiOfvOptim(n, xp.data(), NULL);
+      outerGradNumOptim(n, xp.data(), gp.data(), NULL);
+      for (int i = 0; i < n; ++i) h(i, j) = (gp[i] - g0[i]) / step;
+      xp[j] = x[j];
+    }
+    foceiOfvOptim(n, xp.data(), NULL);    // settle the point again on the way out
+    h = 0.5 * (h + h.t());
+    return true;
+  }
+};
+static FoceiTrustOuter _trustOuter;
+
+static inline int foceiTrustInfeasible(double *value) {
+  *value = std::numeric_limits<double>::infinity();
+  return 1;
+}
+
+extern "C" int foceiTrustObjfun(int n, const double *par, double *value,
+                                double *gradient, double *hessian, void *) {
+  FoceiTrustOuter &t = _trustOuter;
+  if (n != t.n) return -1;
+  try {
+    if (t.snapPending) return 2;   // caught by trust as an objfun error; the driver restarts
+    if (!t.box(par)) {
+      if (t.markExits(par)) t.snapPending = true;
+      return foceiTrustInfeasible(value);
+    }
+    arma::vec xv(par, n);
+    t.clamp(xv);
+    if (t.hasInc && arma::all(xv == t.incX)) {   // a (re)start at the incumbent
+      *value = t.incValue;
+      std::copy(t.incGm.begin(), t.incGm.end(), gradient);
+      std::copy(t.incHm.begin(), t.incHm.end(), hessian);
+      return 0;
+    }
+    std::vector<double> x(xv.begin(), xv.end());
+    double v = foceiOfvOptim(n, x.data(), NULL);
+    if (!R_FINITE(v)) return foceiTrustInfeasible(value);
+    if (t.hasInc && v >= t.incValue) {           // cannot be accepted: value only
+      *value = v;
+      std::copy(t.incGm.begin(), t.incGm.end(), gradient);
+      std::copy(t.incHm.begin(), t.incHm.end(), hessian);
+      return 0;
+    }
+    arma::vec g(n);
+    outerGradNumOptim(n, x.data(), g.memptr(), NULL);
+    if (!g.is_finite()) return foceiTrustInfeasible(value);
+    t.secant(xv, g);
+    arma::mat h;
+    bool have = false;
+    if (t.method == 1) {
+      t.hessianCalls++;
+      h.set_size(n, n);
+      int st = nlmixr2FoceiOuterHessian(x.data(), n, t.relStep, h.memptr());
+      if (st == 0 && h.is_finite()) have = true;
+      else {
+        t.fallback = true; t.method = 2;
+        Rf_warning("analytic outer Hessian unavailable; trust continues with BFGS");
+      }
+    } else if (t.method == 3) {
+      have = t.fd(xv, g, h);
+    }
+    if (!have) h = t.qn;
+    if (!h.is_finite()) return foceiTrustInfeasible(value);
+    arma::vec gm; arma::mat hm;
+    t.mask(g, h, gm, hm);
+    if (t.accepts(xv, v)) {
+      t.hasInc = true; t.incValue = v; t.incX = xv; t.infeasibleRun = 0;
+      t.incG = g; t.incH = h; t.incGm = gm; t.incHm = hm;
+    }
+    *value = v;
+    std::copy(gm.begin(), gm.end(), gradient);
+    std::copy(hm.begin(), hm.end(), hessian);   // symmetric: layout is immaterial
+    return 0;
+  } catch (...) { return -4; }
+}
+
+// The set-up and the verdict are R helpers (.trustOuterMethod, .trustOuterRegion,
+// .trustOuterCount, .trustOuterDecrement, .trustOuterMessage, R/focei.R), called
+// once each; only the trial points stay in C++.
+void foceiTrustOuter(Environment e) {
+  FoceiTrustOuter &t = _trustOuter;
+  Environment nlmixr2 = Environment::namespace_env("nlmixr2est");
+  List ctl = clone(as<List>(e["control"]));
+  ctl["hessian"] = nlmixr2["foceiOuterH"];
+  int n = (int)op_focei.npars;
+  t.n = n;
+  t.lower.assign(op_focei.lower, op_focei.lower + n);
+  t.upper.assign(op_focei.upper, op_focei.upper + n);
+  t.qn = arma::eye(n, n); t.hasPrev = false; t.hessianCalls = 0; t.fallback = false;
+  t.hasInc = false;
+  t.held.assign(n, 0); t.heldAt.assign(n, 0.0); t.snapPending = false;
+  t.activeChanges = 0; t.infeasibleRun = 0;
+  t.relStep = ctl.containsElementNamed("outerTrustRelStep") && !Rf_isNull(ctl["outerTrustRelStep"]) ?
+    as<double>(ctl["outerTrustRelStep"]) : 1e-3;
+  std::string hm = as<std::string>(as<Function>(nlmixr2[".trustOuterMethod"])(ctl));
+  t.method = hm == "analytic" ? 1 : (hm == "fd" ? 3 : 2);
+  NumericVector x(n);
+  for (int k = 0; k < n; ++k) x[k] = scalePar(op_focei.initPar, k);
+  List region = as<List>(as<Function>(nlmixr2[".trustOuterRegion"])(x, ctl));
+  double rinit = as<double>(region["rinit"]), rmax = as<double>(region["rmax"]);
+  t.fterm = as<double>(region["fterm"]); t.mterm = as<double>(region["mterm"]);
+  Function count = as<Function>(nlmixr2[".trustOuterCount"]);
+  int iterlim = as<int>(count(ctl["maxOuterIterations"], 1L));
+  int restarts = as<int>(count(ctl["outerTrustRestarts"], 0L));
+  Function decrement = as<Function>(nlmixr2[".trustOuterDecrement"]);
+  // run, re-entering on an active-set change and while the region collapsed short
+  // of a stationary point
+  int used = 0, left = iterlim, nRestart = 0;
+  bool converged = false, under = false;
+  double decr = NA_REAL, value = NA_REAL;
+  arma::vec arg(x.begin(), n), grad(n, arma::fill::value(NA_REAL));
+  arma::mat hess(n, n, arma::fill::value(NA_REAL));
+  int err = 0;
+  const int maxActive = 2 * n + 2;
+  for (;;) {
+    trust_options_t topts = trust_options_default(rinit, rmax);
+    topts.iterlim = left; topts.fterm = t.fterm; topts.mterm = t.mterm; topts.minimize = 1;
+    trust_result_t tres;
+    trust_solve_c_ptr(n, arg.memptr(), foceiTrustObjfun, NULL, &topts, &tres);
+    err = tres.error;
+    used += tres.iterations; left -= tres.iterations;
+    arma::vec prev = arg;
+    if (t.snapPending) {
+      // restart from the incumbent with the marked coordinates on their bounds
+      t.snapPending = false;
+      trust_result_free_ptr(&tres);
+      if (++t.activeChanges > maxActive || left < 1) { err = 0; converged = false; break; }
+      t.clamp(t.incX);
+      arg = t.incX;
+      t.hasInc = false;   // a new point: evaluate it in full
+      continue;
+    }
+    if (tres.error >= 0 && tres.argument != NULL) {
+      arg = arma::vec(tres.argument, n);
+      value = tres.value; converged = tres.converged != 0;
+    }
+    trust_result_free_ptr(&tres);
+    if (t.hasInc && arma::all(arg == t.incX)) {
+      grad = t.incG; hess = t.incH;
+      if (converged && t.release()) {
+        // a held coordinate wants back in: same point, wider model
+        if (++t.activeChanges <= maxActive && left >= 1) continue;
+      }
+      decr = as<double>(decrement(List::create(_["hessian"] = wrap(t.incHm),
+                                               _["gradient"] = NumericVector(t.incGm.begin(), t.incGm.end()))));
+    } else {
+      decr = NA_REAL;
+    }
+    under = ISNA(decr) || !R_FINITE(decr) || decr > t.fterm;
+    bool again = under && converged && nRestart < restarts && left >= 1 &&
+      arma::abs(arg - prev).max() > 0;
+    if (!again) break;
+    nRestart++;
+  }
+  if (converged && under) Rf_warning("outer trust stopped short of a stationary point");
+  NumericVector xr(arg.begin(), arg.end());
+  if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0);
+  foceiOuterFinal(xr.begin(), e);
+  IntegerVector active;
+  for (int j = 0; j < n; ++j) if (t.held[j]) active.push_back(j + 1);
+  List ret = List::create(_["x"] = xr, _["par"] = xr, _["argument"] = xr, _["value"] = value,
+                          _["gradient"] = NumericVector(grad.begin(), grad.end()),
+                          _["hessian"] = wrap(hess), _["converged"] = converged,
+                          _["iterations"] = used, _["restarts"] = nRestart,
+                          _["newtonDecrement"] = decr, _["underConverged"] = under,
+                          _["convergence"] = converged ? 0 : 1,
+                          _["hessianEvaluations"] = t.hessianCalls,
+                          _["hessianFallback"] = t.fallback, _["error"] = err,
+                          _["activeBounds"] = active, _["activeChanges"] = t.activeChanges);
+  ret["message"] = as<Function>(nlmixr2[".trustOuterMessage"])(ret);
+  e["convergence"] = ret["convergence"];
+  e["message"] = ret["message"];
+  e["optReturn"] = ret;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Overall Outer Problem
 
@@ -10194,6 +10468,10 @@ Environment foceiOuter(Environment e){
       break;
     case -1:
       foceiCustomFun(e);
+      break;
+    case -2:
+      foceiTrustOuter(e);
+      break;
     }
     op_foceiUseAnalyticGrad = false;
   } else {

@@ -1704,9 +1704,9 @@ foceiControl <- function(
       outerOptFun <- .newuoa
       outerOpt <- -1L
     } else if (outerOpt == "trust") {
+      # driven from C++ (foceiTrustOuter), not through outerOptFun
       rxode2::rxReq("RcppTrust")
-      outerOptFun <- .trustOuter
-      outerOpt <- -1L
+      outerOpt <- -2L
     } else {
       if (checkmate::testIntegerish(outerOpt, lower = 0, upper = 1, len = 1)) {
         outerOpt <- as.integer(outerOpt)
@@ -1722,6 +1722,9 @@ foceiControl <- function(
   } else if (is(outerOpt, "function")) {
     outerOptFun <- outerOpt
     outerOpt <- -1L
+  } else if (identical(.outerOptTxt, "trust")) {
+    # a round-tripped control: trust has no outerOptFun, only its code
+    outerOpt <- -2L
   }
   # A derivative-free outer optimizer never consumes the analytic 'fast' gradient,
   # so computing it is wasted work: downgrade to fast=FALSE with a warning.
