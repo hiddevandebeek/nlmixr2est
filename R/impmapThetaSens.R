@@ -53,18 +53,25 @@
 }
 
 #' @noRd
-.impmapChainRule <- function(s, target, j, stateVars, structIdx, lag = s$..lagEta) {
-  if (!is.null(lag)) {
-    # chained through the lagged variables (#1176)
-    .e <- get(target, envir = s)
-    return(lag$txt(lag$dfe(.e, paste0("THETA_", j, "_")), paste0("THETA_", j, "_")))
-  }
-  .terms <- paste0("D(", target, ", THETA_", j, "_)")
-  if (j %in% structIdx && length(stateVars) > 0L) {
-    .terms <- c(.terms, paste0("rx__sens_", stateVars, "_BY_THETA_", j, "___*D(", target, ", ", stateVars, ")"))
+.rxSensitivityChainRule <- function(s, target, parameter, stateVars) {
+  .terms <- paste0("D(", target, ", ", parameter, ")")
+  if (length(stateVars) > 0L) {
+    .terms <- c(.terms, paste0("rx__sens_", stateVars, "_BY_", parameter,
+                             "__*D(", target, ", ", stateVars, ")"))
   }
   .l <- eval(parse(text = paste0("with(s, ", paste(.terms, collapse = "+"), ")")))
   rxode2::rxFromSE(.l)
+}
+
+#' @noRd
+.impmapChainRule <- function(s, target, j, stateVars, structIdx, lag = s$..lagEta) {
+  .parameter <- paste0("THETA_", j, "_")
+  if (!is.null(lag)) {
+    # chained through the lagged variables (#1176)
+    .e <- get(target, envir = s)
+    return(lag$txt(lag$dfe(.e, .parameter), .parameter))
+  }
+  .rxSensitivityChainRule(s, target, .parameter, if (j %in% structIdx) stateVars else character())
 }
 
 # Build the symengine env carrying the impmap sensitivity model

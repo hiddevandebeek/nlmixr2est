@@ -478,10 +478,11 @@ nlmixr2LikPenaltyUdf <- function(spec) {
 #' @param thetaNames ui theta names (theta order)
 #' @param thetaEst ui theta estimates (theta order)
 #' @param omegaTrans saem phi1 slot (1-based) of each ini() eta, NA for none
+#' @param resNames residual parameters in SAEM endpoint order
 #' @return the configuration, with `penMap`/`penTheta0`/`penEtaOrd` when
 #'   penalties are on
 #' @noRd
-.saemLikPenaltyCfg <- function(a, estNames, thetaNames, thetaEst, omegaTrans = NULL) {
+.saemLikPenaltyCfg <- function(a, estNames, thetaNames, thetaEst, omegaTrans = NULL, resNames = NULL) {
   if (.likPenaltyInfo()[["n"]] == 0L) {
     return(a)
   }
@@ -493,6 +494,7 @@ nlmixr2LikPenaltyUdf <- function(spec) {
   .m[is.na(.m)] <- -1L
   a$penMap <- as.integer(.m)
   a$penTheta0 <- as.double(thetaEst)
+  a$penResMap <- as.integer(match(resNames, thetaNames, nomatch = 0L) - 1L)
   if (length(omegaTrans) > 0L) {
     .o <- as.integer(omegaTrans) - 1L
     .o[is.na(.o)] <- -1L

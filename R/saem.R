@@ -42,7 +42,8 @@
   # nmc number of mc interations
   checkmate::assertIntegerish(cfg$nmc, lower = 0, len = 1, .var.name = "saem.cfg$nmc")
   # nu is the number of selection for each probability type.
-  checkmate::assertIntegerish(cfg$nu, lower = 0, len = 3, .var.name = "saem.cfg$nu")
+  checkmate::assertIntegerish(cfg$nu, lower = 0, .var.name = "saem.cfg$nu")
+  if (!length(cfg$nu) %in% c(3L, 5L)) stop("Invalid SAEM kernel schedule", call.=FALSE)
   # Overall number of iterations
   checkmate::assertIntegerish(cfg$niter, lower = 0, len = 1, .var.name = "saem.cfg$niter")
   # Number of iterations where the correlation is ignored
@@ -246,6 +247,10 @@
   ## hasDelay enforcement here so the SAEM solve and the covariance dopred both use
   ## the dense dop853 path.
   .saemMv <- rxode2::rxModelVars(attr(.model$saem_mod, "rx"))
+  .nSens <- sum(startsWith(.saemMv$state, "rx__sens_"))
+  if (.nSens > 0L) {
+    .rxControl <- rxode2::rxControlUpdateSens(.rxControl, .nSens, length(.saemMv$state))
+  }
   if (isTRUE(.saemMv$flags[["hasDelay"]] == 1L)) {
     .rxControl$method <- 0L # dop853 (dense; no analytic Jacobian required)
     .rxControl$stiff2 <- 0L
@@ -276,6 +281,10 @@
         data = data,
         inits = .inits,
         mcmc = rxode2::rxGetControl(ui, "mcmc", list(niter = c(200, 300), nmc = 3, nu = c(2, 2, 2))),
+        malaStep = rxode2::rxGetControl(ui, "malaStep", 0),
+        hmcStep = rxode2::rxGetControl(ui, "hmcStep", 0),
+        hmcSteps = rxode2::rxGetControl(ui, "hmcSteps", 4L),
+        phi0Fisher = .saemFisherRequested(ui),
         rxControl = .rxControl,
         distribution = if (.saemGeneralLik(ui)) "general" else "normal",
         fixedOmega = ui$saemModelOmegaFixed,
@@ -343,7 +352,7 @@
       .cfg$nonMuThetaOptType <- as.integer(
         match(
           rxode2::rxGetControl(ui, "nonMuThetaOpt", "newuoa"),
-          c("optimize", "nelderMead", "newuoa"),
+          c("optimize", "nelderMead", "newuoa", "fisher"),
           nomatch = 1L
         ) -
           1L
@@ -406,6 +415,10 @@
         .hi <- ui$iniDf$upper[match(.phi0Names, ui$iniDf$name)]
         .cfg$phi0Lower <- ifelse(is.na(.lo), -Inf, .lo)
         .cfg$phi0Upper <- ifelse(is.na(.hi), Inf, .hi)
+        .coefNames <- .pars[.cfg$ilambda0 + 1L]
+        .coefRows <- match(.coefNames, ui$iniDf$name)
+        .cfg$phi0CoefLower <- ui$iniDf$lower[.coefRows]
+        .cfg$phi0CoefUpper <- ui$iniDf$upper[.coefRows]
       }
       .cfg$plateauStop <- as.integer(isTRUE(rxode2::rxGetControl(ui, "plateauStop", FALSE)))
       .cfg$plateauWindow <- as.integer(rxode2::rxGetControl(ui, "plateauWindow", 50L))

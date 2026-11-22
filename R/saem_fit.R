@@ -240,7 +240,11 @@
   omegaShareSubpop = integer(0),
   omegaPool = integer(0),
   omegaPoolMean = 0L,
-  fixedNoEta = c("hold", "converge")
+  fixedNoEta = c("hold", "converge"),
+  malaStep = 0,
+  hmcStep = 0,
+  hmcSteps = 4L,
+  phi0Fisher = FALSE
 ) {
   fixedNoEta <- match.arg(fixedNoEta)
   if (is.null(fixedOmega)) {
@@ -734,6 +738,21 @@
   opt$distribution <- distribution
   opt$paramUpdate <- attr(model$saem_mod, "paramUpdate")
   optM$paramUpdate <- attr(model$saem_mod, "paramUpdate")
+  .gradient <- malaStep > 0 || hmcStep > 0
+  if (.gradient || phi0Fisher) {
+    .scoreLhs <- attr(model$saem_mod, "scoreLhs")
+    .eligible <- distribution == 1 && length(mixProb) <= 1L
+    .uncensored <- (is.null(data$nmdat$CENS) || !any(data$nmdat$CENS != 0, na.rm = TRUE)) &&
+      (is.null(data$nmdat$LIMIT) || !any(is.finite(data$nmdat$LIMIT)))
+    .hasScore <- length(.scoreLhs) > 0L && !anyNA(.scoreLhs)
+    if (.gradient && .eligible && .uncensored && .hasScore) {
+      optM$scoreLhs <- .scoreLhs
+    }
+    if (phi0Fisher && distribution %in% c(1L, 4L)) {
+      optM$phi0Joint <- TRUE
+      if (length(.scoreLhs)) optM$phi0ScoreLhs <- .scoreLhs
+    }
+  }
   opt$rxControl <- rxControl
   optM$rxControl <- rxControl
   cfg <- list(
@@ -749,6 +768,9 @@
     ueTol = ueTol,
     inits = inits.save,
     nu = mcmc$nu,
+    malaStep = malaStep,
+    hmcStep = hmcStep,
+    hmcSteps = hmcSteps,
     niter = niter,
     nPhase1 = vna[1],
     nb_sa = nb_sa,

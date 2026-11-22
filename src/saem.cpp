@@ -827,6 +827,21 @@ class SAEM {
   typedef mat (*user_funct) (const mat&, const mat&, const List&);
 
 public:
+  NumericVector getGradientCounts(bool hmc) const {
+    const auto &kernel = hmc ? hmcKernel : malaKernel;
+    return NumericVector::create(_["accepted"] = static_cast<double>(kernel.accepted),
+                                 _["proposed"] = static_cast<double>(kernel.proposed));
+  }
+
+  bool hasGradientKernel(bool hmc) const {
+    return (hmc ? hmcKernel : malaKernel).transitions > 0;
+  }
+
+  const char *gradientScoreMethod() const {
+    if (gradientUsedNumerical) return gradientUsedAnalytic ? "mixed" : "finiteDifference";
+    return gradientUsedAnalytic ? "sensitivity" : "unused";
+  }
+
   SAEM() {
     user_fn = NULL;
   }
@@ -838,6 +853,7 @@ public:
   // the model prediction column is the per-observation log-likelihood).  Summed
   // over all chains, which is the SAEM stochastic-approximation objective.
   double phi0Objective(double *p) {
+    ++phi0ObjectiveEvals;
     mat phiCand = phiM;
     for (int c = 0; c < nphi0; c++) {
       phiCand.col(i0(c)).fill(p[c]);
@@ -1154,8 +1170,390 @@ public:
     }
   }
 
-  void refinePhi0Lik(unsigned int kiter, const vec &pas) {
-    if (nphi0 <= 0) return;
+  // Optimize structural theta and log residual SD against the same fixed draws.
+  // The Gaussian information separates into mean and log-SD outer products.
+  bool refinePhi0Joint(double gain, unsigned int kiter) {
+    if (!optM.containsElementNamed("phi0Joint")) return false;
+    const bool gaussian = distribution == 1;
+    const bool whiten = gaussian && hasAr;
+    const bool penalized = nlmixrPenNPop() || nlmixrPenNSubject();
+    const int components = std::max(nMix, 1);
+    const uword chainRows = (uword)nmc * ntotal;
+    auto componentDraws = [&](int component) -> const mat & {
+      return components == 1 || mixSampleMethod == 1 ? phiM : phiM_mix(component);
+    };
+    auto responsibility = [&](int component, int id) {
+      return components == 1 ? 1.0 : mixWeights(id, component);
+    };
+    vec coefficients;
+    uvec free, cols, thetaColumns;
+    if (nphi0) {
+      coefficients = MCOV0(jcov0);
+      uvec movable(coefficients.n_elem, fill::ones);
+      movable.elem(fixedIx0).zeros();
+      movable.elem(mixOwnLam0).zeros();
+      free = find(movable);
+      thetaColumns.set_size(free.n_elem);
+      for (uword c = 0; c < free.n_elem; ++c) {
+        thetaColumns(c) = LCOV0.row(free(c)).index_max();
+      }
+      cols = i0.elem(thetaColumns);
+    }
+    List evalOpt = optM;
+    bool useScore = gaussian && hasFixedObsTransform && !hasAr && !penalized;
+    if (useScore && !free.is_empty()) {
+      useScore = optM.containsElementNamed("phi0ScoreLhs");
+      if (useScore) {
+        const ivec lhs = as<ivec>(optM["phi0ScoreLhs"]);
+        useScore = cols.max() < lhs.n_elem && !any(lhs.elem(cols) < 0);
+        if (useScore) {
+          evalOpt = clone(optM);
+          evalOpt["scoreLhs"] = conv_to<uvec>::from(lhs.elem(cols));
+        }
+      }
+    }
+    const uword nTheta = free.n_elem;
+    if (kiter <= (unsigned int)nb_fixResid && any(resFixed != 0)) return false;
+    const uword nEnd = nendpnt;
+    vec residual0 = join_cols(join_cols(ares, bres), join_cols(join_cols(cres, lres), arCor));
+    std::vector<uword> slots;
+    ivec residualTheta(5*nEnd, fill::value(-1));
+    if (gaussian) for (uword b = 0; b < nEnd; ++b) {
+      const int model = res_mod(b);
+      if (model < rmAdd || model > rmAddPowLam) return false;
+      const bool estimatesTransform = model >= rmAddLam;
+      const int rm = estimatesTransform ? model - (rmAddLam - rmAdd) : model;
+      uword offset = res_offset(b);
+      auto addSlot = [&](uword index) {
+        if (offset < penResMap.n_elem) residualTheta(index) = penResMap(offset);
+        if (resFixed(offset)) residual0(index) = resValue(offset);
+        else slots.push_back(index);
+        ++offset;
+      };
+      if (rm == rmAdd || rm == rmAddProp || rm == rmAddPow) addSlot(b);
+      if (rm != rmAdd) addSlot(b + nEnd);
+      if (rm == rmPow || rm == rmAddPow) addSlot(b + 2*nEnd);
+      if (estimatesTransform) addSlot(b + 3*nEnd);
+      if (arActive(b)) slots.push_back(b + 4*nEnd);
+    }
+    const uvec resFree = conv_to<uvec>::from(slots);
+    vec residualPar = residual0.elem(resFree);
+    vec resLower(resFree.n_elem), resUpper(resFree.n_elem);
+    for (uword c = 0; c < resFree.n_elem; ++c) {
+      if (!std::isfinite(residualPar(c))) return false;
+      if (resFree(c) < 2*nEnd) {
+        if (residualPar(c) <= 0) return false;
+        residualPar(c) = std::log(residualPar(c));
+        resLower(c) = residualPar(c) - std::log(5.0);
+        resUpper(c) = residualPar(c) + std::log(5.0);
+      } else if (resFree(c) >= 4*nEnd) {
+        resLower(c) = 0.0;
+        resUpper(c) = 0.99;
+      } else {
+        const double range = resFree(c) < 3*nEnd ? _saemPowR : _saemLambdaR;
+        resLower(c) = -range;
+        resUpper(c) = range;
+      }
+    }
+    vec lower = resLower, upper = resUpper, current = residualPar;
+    if (nTheta) {
+      const vec start = coefficients.elem(free);
+      vec thetaLower = start - 0.75, thetaUpper = start + 0.75;
+      for (uword c = 0; c < nTheta; ++c) {
+        const uword j = free(c);
+        if (j < phi0CoefLower.n_elem && std::isfinite(phi0CoefLower(j)))
+          thetaLower(c) = std::max(thetaLower(c), phi0CoefLower(j));
+        if (j < phi0CoefUpper.n_elem && std::isfinite(phi0CoefUpper(j)))
+          thetaUpper(c) = std::min(thetaUpper(c), phi0CoefUpper(j));
+      }
+      lower = join_cols(thetaLower, resLower);
+      upper = join_cols(thetaUpper, resUpper);
+      current = join_cols(start, residualPar);
+    }
+    if (current.is_empty()) return false;
+    const int budget = nonMuThetaMaxEval > 0 ? nonMuThetaMaxEval : 10 * current.n_elem;
+    int evals = 1;
+    auto predict = [&](const vec &par) {
+      // Each mixture hypothesis is solved on its own draws. MSAEM shares
+      // one draw across hypotheses. Restore the solver's mixture selector.
+      struct RestoreMix {
+        int &selector;
+        int saved;
+        bool freeze;
+        ~RestoreMix() { selector = saved; _saemFreezeOde = freeze; }
+      } restore{current_saem_state->_saemMixest, current_saem_state->_saemMixest, _saemFreezeOde};
+      _saemFreezeOde = false;
+      mat phi0;
+      if (nTheta) {
+        vec candidate = coefficients;
+        candidate.elem(free) = par.head(nTheta);
+        phi0 = COV0 * (LCOV0.each_col() % candidate);
+      }
+      const uvec updated = unique(thetaColumns);
+      mat predictions(components * chainRows, 3 + (useScore ? nTheta : 0));
+      for (int m = 0; m < components; ++m) {
+        mat phiCand = componentDraws(m);
+        for (uword c : updated) phiCand.col(i0(c)) = repmat(phi0.col(c), nmc, 1);
+        if (components > 1) restore.selector = m + 1;
+        ++phi0ObjectiveEvals;
+        const mat evaluated = user_fn(phiCand, evt, evalOpt);
+        if (evaluated.n_rows != chainRows || evaluated.n_cols < predictions.n_cols) return mat();
+        predictions.rows(m * chainRows, (m + 1) * chainRows - 1) =
+          evaluated.head_cols(predictions.n_cols);
+      }
+      return predictions;
+    };
+    mat observationWeights(ntotal, components, fill::ones);
+    if (components > 1) observationWeights = mixWeights.rows(obs_subject);
+    auto evaluate = [&](const vec &par, const mat &rows, vec *gradient, mat *info) {
+      if (rows.n_rows != components * chainRows || rows.n_cols < 3 + (gradient ? nTheta : 0)) return R_PosInf;
+      vec residual = residual0;
+      for (uword c = 0; c < resFree.n_elem; ++c) {
+        const uword slot = resFree(c);
+        residual(slot) = slot < 2*nEnd ? std::exp(par(nTheta + c)) : par(nTheta + c);
+      }
+      vec meanDeriv(par.n_elem, fill::zeros), sdDeriv(par.n_elem, fill::zeros);
+      vec arY, arF, arSd, censor, limits, correlations;
+      if (whiten) {
+        arY.set_size(ntotal); arF.set_size(ntotal); arSd.set_size(ntotal);
+        censor.set_size(ntotal); limits.set_size(ntotal);
+        correlations = residual.tail(nEnd);
+      }
+      double value = 0.0;
+      if (penalized && !_penTheta.empty()) {
+        auto theta = _penTheta;
+        for (uword c = 0; c < nTheta; ++c) {
+          const int index = _penMap[ilambda0(free(c))];
+          if (index >= 0) theta[index] = par(c);
+        }
+        for (uword i = 0; i < residualTheta.n_elem; ++i) {
+          const int index = residualTheta(i);
+          if (index >= 0 && (size_t)index < theta.size()) theta[index] = residual(i);
+        }
+        if (nlmixrPenNPop())
+          value += 0.5 * nmc * nlmixrPenPopAll(theta.size(), theta.data(), 0, nullptr, N, nullptr, nullptr);
+        if (nlmixrPenNSubject() && _penMphi1 != nullptr) {
+          const int nq = _penMphi1->nphi;
+          vec eta(nq);
+          for (int m = 0; m < components; ++m) {
+            const mat &draws = componentDraws(m);
+            for (int r = 0; r < nM; ++r) {
+              const int id = r % N;
+              const double w = responsibility(m, id);
+              if (w <= 0) continue;
+              for (int q = 0; q < nq; ++q) {
+                eta(q) = draws(r, _penMphi1->i(q)) - _penMphi1->mprior_phiM(r, q);
+              }
+              const int nobs = ix_idM(id, 1) - ix_idM(id, 0) + 1;
+              value -= w * penSubjLL(id, eta.memptr(), nq, nobs, &theta);
+            }
+          }
+        }
+      }
+      for (int m = 0; m < components; ++m) {
+        const auto weights = observationWeights.col(m);
+        for (int k = 0; k < nmc; ++k) {
+          for (int j = 0; j < ntotal; ++j) {
+            const double w = weights(j);
+            if (w <= 0) {
+              if (whiten) {
+                arY(j) = arF(j) = censor(j) = 0;
+                arSd(j) = 1;
+                limits(j) = R_NegInf;
+              }
+              continue;
+            }
+            const uword obs = m * chainRows + k * ntotal + j;
+            const int b = ix_endpnt(j);
+            const double raw = rows(obs, 0);
+            if (!std::isfinite(raw) || std::abs(raw) >= 1e99) return R_PosInf;
+            if (!gaussian) {
+              value -= w * std::min(raw, _saemGenLikCeiling);
+              continue;
+            }
+            const double lam = residual(b + 3*nEnd);
+            const int transform = yj(b);
+            const double transLo = low(b), transHi = hi(b);
+            const double pred = _powerD(raw, lam, transform, transLo, transHi);
+            const double observed = hasFixedObsTransform ? yTrans(j) :
+              _powerD(y(j), lam, transform, transLo, transHi);
+            const double fac = propT(b) ? pred : raw;
+            // Matches the existing E-step scale convention at a zero predictor.
+            const double absFac = fac == 0 ? 1.0 : std::abs(fac);
+            const double power = residual(b + 2*nEnd);
+            const double a = residual(b), prop = residual(b + nEnd);
+            const double bp = prop == 0 ? 0 : prop * (power == 1 ? absFac : std::pow(absFac, power));
+            const bool combined1 = addProp(b) == 1;
+            const double scale = combined1 ? a + bp : std::hypot(a, bp);
+            if (!(scale > 1e-200 && scale < 1e300)) return R_PosInf;
+            const double z = (observed - pred) / scale;
+            const double cens = rows(obs, 1);
+            const double rawLimit = rows(obs, 2);
+            const double limit = std::isfinite(rawLimit)
+              ? _powerD(rawLimit, lam, transform, transLo, transHi) : R_NegInf;
+            const double variance = scale * scale;
+            const double normalLogLik = -0.5 * z * z - std::log(scale);
+            const bool censored = cens != 0 || std::isfinite(limit);
+            if (!hasFixedObsTransform && cens == 0)
+              value -= w * _powerL(y(j), lam, transform, transLo, transHi);
+            if (whiten) {
+              arY(j) = observed;
+              arF(j) = pred;
+              arSd(j) = scale;
+              censor(j) = cens;
+              limits(j) = limit;
+              continue;
+            }
+            value -= w * doCensNormal1(cens, observed, limit, normalLogLik, pred, variance, 0);
+            if (!gradient) continue;
+            const double transformSlope = nTheta ? _powerDD(raw, lam, transform, transLo, transHi) : 0;
+            const double propFrac = bp / scale;
+            const double propWeight = combined1 ? propFrac : propFrac * propFrac;
+            const double addFrac = a / scale;
+            const double addWeight = combined1 ? addFrac : addFrac * addFrac;
+            const double scaleByFac = bp == 0 || fac == 0 ? 0 : propWeight * power / fac;
+            const double scaleSlope = scaleByFac * (propT(b) ? transformSlope : 1);
+            for (uword c = 0; c < nTheta; ++c) {
+              const double derivative = rows(obs, 3 + c) * COV0(obs_subject(j), free(c));
+              meanDeriv(c) = transformSlope * derivative / scale;
+              sdDeriv(c) = scaleSlope * derivative;
+            }
+            for (uword c = 0; c < resFree.n_elem; ++c) {
+              const uword slot = resFree(c);
+              double derivative = 0;
+              if (slot == (uword)b) derivative = addWeight;
+              else if (slot == b + nEnd) derivative = propWeight;
+              else if (slot == b + 2*nEnd && bp != 0) derivative = propWeight * std::log(absFac);
+              sdDeriv(nTheta + c) = derivative;
+            }
+            if (censored) {
+              double partials[5] = {};
+              censNormalPartials(cens, observed, limit, pred, variance, 2, partials);
+              *gradient += w * ((partials[0] * scale) * meanDeriv + (2 * partials[1] * variance) * sdDeriv);
+            } else {
+              *gradient -= w * (z * meanDeriv + (z*z - 1) * sdDeriv);
+            }
+            // The complete Gaussian information is a positive scoring metric
+            // for censored rows. The line search uses their exact likelihood.
+            *info += w * (meanDeriv * meanDeriv.t() + 2 * sdDeriv * sdDeriv.t());
+          }
+          if (whiten) {
+            mat loss = arDYFhyp(arY, arF, arSd, &correlations);
+            applyCensLoss(loss, regspace<uvec>(0, ntotal - 1), censor, arY, limits,
+                          _scratch_ftAr, _scratch_gAr);
+            for (int j = 0; j < ntotal; ++j) if (weights(j) > 0) value += weights(j) * loss(j);
+          }
+        }
+      }
+      return value;
+    };
+
+    mat rows = predict(current);
+    double initialValue = R_PosInf;
+    bool converged = false;
+    while (useScore) {
+      vec gradient(current.n_elem, fill::zeros);
+      mat info(current.n_elem, current.n_elem, fill::zeros);
+      const double value = evaluate(current, rows, &gradient, &info);
+      if (evals == 1) initialValue = value;
+      if (!std::isfinite(value) || !gradient.is_finite() || !info.is_finite()) break;
+      const uvec active = find(((current > lower) || (gradient < 0)) &&
+                               ((current < upper) || (gradient > 0)) && (upper > lower));
+      if (active.is_empty()) { converged = true; break; }
+      vec direction;
+      if (!solve(direction, info.submat(active, active), -gradient.elem(active),
+                 solve_opts::likely_sympd + solve_opts::no_approx)) break;
+      vec step(current.n_elem, fill::zeros);
+      step.elem(active) = direction;
+      if (norm(step, "inf") <= nonMuThetaTol) { converged = true; break; }
+      bool accepted = false;
+      for (double fraction = 1; fraction >= 1.0/64 && evals < budget; fraction *= 0.5) {
+        const vec trial = arma::min(arma::max(vec(current + fraction * step), lower), upper);
+        if (norm(trial - current, "inf") <= nonMuThetaTol) continue;
+        const bool movedTheta = nTheta && any(trial.head(nTheta) != current.head(nTheta));
+        mat trialRows;
+        if (movedTheta) trialRows = predict(trial);
+        ++evals;
+        const double trialValue = evaluate(trial, movedTheta ? trialRows : rows, nullptr, nullptr);
+        if (std::isfinite(trialValue) && trialValue < value) {
+          current = trial;
+          if (movedTheta) rows = std::move(trialRows);
+          accepted = true;
+          break;
+        }
+      }
+      if (!accepted) break;
+    }
+    if (converged) {
+      ++phi0FisherConverged;
+    } else {
+      // The same objective also works with the value-only SAEM model. Reuse
+      // the existing bounded optimizer when no score is available or usable.
+      if (budget <= 1 || any(upper <= lower)) return false;
+      vec best = current;
+      vec solvedTheta = current.head(nTheta);
+      double bestValue = evaluate(current, rows, nullptr, nullptr);
+      if (!useScore) initialValue = bestValue;
+      auto objective = [&](const double *par) {
+        const vec candidate(par, current.n_elem);
+        if (nTheta && any(candidate.head(nTheta) != solvedTheta)) {
+          rows = predict(candidate);
+          solvedTheta = candidate.head(nTheta);
+        }
+        const double value = evaluate(candidate, rows, nullptr, nullptr);
+        if (std::isfinite(value) && value < bestValue) {
+          best = candidate;
+          bestValue = value;
+        }
+        return std::isfinite(value) ? value : 1e300;
+      };
+      boundedResidOptC(current.n_elem, current.memptr(), lower.memptr(), upper.memptr(),
+                      objective, nonMuThetaTol, budget);
+      if (!(bestValue < initialValue)) return false;
+      current = std::move(best);
+      ++phi0JointDirect;
+    }
+    if (nTheta) {
+      const vec start = coefficients.elem(free);
+      MCOV0.elem(jcov0.elem(free)) = start + gain * (current.head(nTheta) - start);
+      mprior_phi0 = COV0 * MCOV0;
+    }
+    for (uword c = 0; c < resFree.n_elem; ++c) {
+      const uword slot = resFree(c);
+      const double estimate = current(nTheta + c);
+      if (slot < 2*nEnd) {
+        // Apply the SA gain on the variance scale for an SD parameter.
+        const double ratio = std::exp(2 * (estimate - residualPar(c)));
+        residual0(slot) *= std::sqrt(1 + gain * (ratio - 1));
+      } else {
+        residual0(slot) += gain * (estimate - residual0(slot));
+      }
+    }
+    if (!gaussian) return true;
+    ares = residual0.head(nEnd);
+    bres = residual0.subvec(nEnd, 2*nEnd - 1);
+    cres = residual0.subvec(2*nEnd, 3*nEnd - 1);
+    lres = residual0.subvec(3*nEnd, 4*nEnd - 1);
+    arCor = residual0.tail(nEnd);
+    lambda = lres;
+    return true;
+  }
+
+  unsigned int phi0ObjectiveEvals = 0, phi0FisherConverged = 0, phi0FisherFallback = 0, phi0JointDirect = 0;
+  IntegerVector phi0OptimizerCounts() const {
+    return IntegerVector::create(Named("evaluations") = phi0ObjectiveEvals,
+                                 Named("fisherConverged") = phi0FisherConverged,
+                                 Named("fisherFallback") = phi0FisherFallback,
+                                 Named("jointDerivativeFree") = phi0JointDirect);
+  }
+
+  bool refinePhi0Lik(unsigned int kiter, const vec &pas) {
+    if (nphi0 <= 0) return false;
+    if (nonMuThetaOptType == 3 && pas(kiter) > 0.0) {
+      if (refinePhi0Joint(pas(kiter), kiter)) return true;
+      ++phi0FisherFallback;
+      if (nMix > 1 || any(sum(LCOV0, 0) != 1)) return false;
+    }
     // A user-FIXED phi0 theta must not be touched here.  Once this refinement
     // owns phi0 the stochastic update that restores MCOV0(fixedIx0) is skipped
     // (skipStochPhi0), so anything this function writes to a fixed entry is
@@ -1169,7 +1567,7 @@ public:
     for (int c = 0; c < nphi0; ++c) {
       if (!phi0Fix[(size_t)c]) gPhi0FreeIx.push_back(c);
     }
-    if (gPhi0FreeIx.empty()) return;
+    if (gPhi0FreeIx.empty()) return false;
     // Snapshot the fixed MCOV0 entries: the closing least-squares update rewrites
     // all of MCOV0 from mprior_phi0, which redistributes a fixed theta's value
     // across the design even when its coordinate never moved.
@@ -1191,7 +1589,7 @@ public:
       // the objective constant in it -- see phi0NeedsLiveSolve() and #1000.
       if (_phi0NeedsLive < 0) _phi0NeedsLive = phi0NeedsLiveSolve() ? 1 : 0;
       doFreeze = (_phi0NeedsLive == 0);
-    } else if (nonMuThetaRegress) {
+    } else if (nonMuThetaRegress && nMix <= 1) {
       if (_phi0OdeSensitive < 0) _phi0OdeSensitive = phi0AffectsOde() ? 1 : 0;
       doFreeze = (_phi0OdeSensitive == 0);
     } else {
@@ -1341,6 +1739,7 @@ public:
       mprior_phi0.col(c).fill(cur + pas(kiter) * (xmin[c] - cur));
     }
     phi0BackSolveMCOV(mcov0Fixed);
+    return false;
   }
 
   // Back-solve MCOV0 from mprior_phi0, one phi0 column at a time
@@ -1693,15 +2092,16 @@ public:
   //   phi_i = cor^dt_i, eps_i = e_i - phi_i*e_{prev}, gstar_i = g_i*sqrt(1-phi_i^2).
   // The first record of each subject/endpoint (arPrev<0) is left marginal.  The
   // previous residual is the RAW (pre-whitening) residual, so snapshot e first.
-  void arWhiten(vec &e, vec &g) {
+  void arWhiten(vec &e, vec &g, const vec *candidate = nullptr) {
     if (!hasAr) return;
+    const vec &correlations = candidate ? *candidate : arCor;
     vec e0 = e;
     for (arma::uword i = 0; i < e.n_elem; ++i) {
       int b = (int)ix_endpnt(i);
       if (!arActive(b)) continue;
       arma::sword p = arPrev(i);
       if (p < 0) continue;
-      double phi = std::pow(arCor(b), arDt(i));
+      double phi = std::pow(correlations(b), arDt(i));
       double om = 1.0 - phi*phi;
       if (om < 1e-8) om = 1e-8;
       e(i) = e0(i) - phi*e0((arma::uword)p);
@@ -1714,10 +2114,10 @@ public:
   // writes the whitened (conditional) prediction/SD into _scratch_ftAr/_scratch_gAr
   // so a censored row on the SAME chain can be scored against the AR(1)
   // conditional distribution, not the marginal (ft, g) -- see #918.
-  vec arDYFhyp(const vec &yt, const vec &ft, const vec &g) {
+  vec arDYFhyp(const vec &yt, const vec &ft, const vec &g, const vec *candidate = nullptr) {
     vec e = yt - ft;
     vec gg = g;
-    arWhiten(e, gg);
+    arWhiten(e, gg, candidate);
     _scratch_ftAr = yt - e;
     _scratch_gAr = gg;
     return 0.5*(e/gg)%(e/gg) + log(gg);
@@ -2522,6 +2922,16 @@ public:
 
     nmc = as<int>(x["nmc"]);
     nu = as<uvec>(x["nu"]);
+    if (x.containsElementNamed("malaStep")) malaKernel.step = as<double>(x["malaStep"]);
+    if (x.containsElementNamed("hmcStep")) hmcKernel.step = as<double>(x["hmcStep"]);
+    if (x.containsElementNamed("hmcSteps")) hmcKernel.steps = as<int>(x["hmcSteps"]);
+    malaKernel.transitions = nu.n_elem > 3 ? nu(3) : malaKernel.step > 0;
+    hmcKernel.transitions = nu.n_elem > 4 ? nu(4) : hmcKernel.step > 0;
+    if ((malaKernel.transitions && malaKernel.step <= 0) ||
+        (hmcKernel.transitions && hmcKernel.step <= 0)) {
+      stop("Gradient transitions require a positive step size");
+    }
+
     niter = as<int>(x["niter"]);
     saemSeed = x.containsElementNamed("seed") ? as<int>(x["seed"]) : 99;
     nb_correl = as<int>(x["nb_correl"]);
@@ -2544,6 +2954,10 @@ public:
     if (x.containsElementNamed("phi0Lower")) {
       phi0Lower = as<vec>(x["phi0Lower"]);
       phi0Upper = as<vec>(x["phi0Upper"]);
+    }
+    if (x.containsElementNamed("phi0CoefLower")) {
+      phi0CoefLower = as<vec>(x["phi0CoefLower"]);
+      phi0CoefUpper = as<vec>(x["phi0CoefUpper"]);
     }
     nb_sa = as<int>(x["nb_sa"]);
     // Phase-1 (SA/burn) iteration count for the print's SA/EM row tag; -1
@@ -2686,12 +3100,14 @@ public:
     Plambda.elem(ilambda1) = MCOV1.elem(jcov1);
     if (nphi0 > 0) Plambda.elem(ilambda0) = MCOV0.elem(jcov0);
     _penMap.clear();
+    penResMap.reset();
     _penTheta.clear();
     _penEtaOrd.clear();
     if (x.containsElementNamed("penEtaOrd")) {
       IntegerVector eo = as<IntegerVector>(x["penEtaOrd"]);
       _penEtaOrd.assign(eo.begin(), eo.end());
     }
+    if (x.containsElementNamed("penResMap")) penResMap = as<ivec>(x["penResMap"]);
     if (x.containsElementNamed("penMap") && x.containsElementNamed("penTheta0")) {
       IntegerVector pm = as<IntegerVector>(x["penMap"]);
       NumericVector pt = as<NumericVector>(x["penTheta0"]);
@@ -2961,16 +3377,12 @@ public:
       as<int>(x["residWarmStart"]) : 1;
     mixProbRegress = x.containsElementNamed("mixProbRegress") ?
       as<int>(x["mixProbRegress"]) : 0;
-    // Mixtures: the direct phi0 optimizer does not partition a per-component
-    // structural theta (tcl1/tcl2) by subject membership, so it would leave an
-    // under-populated component's theta unconstrained (runaway).  Fall back to
-    // the stochastic phi0 block, which respects membership via the per-chain
-    // mixest regressor.  (nMix is read earlier in inits.)  Likewise the residual
-    // warm-start (formed at the population eta=0 prediction) is especially
-    // unreliable for a mixture -- the poor initial fit inflates the residual and
-    // flattens the likelihood, preventing the components from separating.  Both
-    // gates must follow the reads above so they are not overwritten.
-    if (nMix > 1) { nonMuThetaRegress = 0; residWarmStart = 0; }
+    // Only the joint optimizer uses component-weighted conditional draws.
+    // Mixtures also bypass the population eta=0 residual warm start.
+    if (nMix > 1) {
+      if (nonMuThetaOptType != 3) nonMuThetaRegress = 0;
+      residWarmStart = 0;
+    }
     // (mixProbMethod="regress" degeneracy fallback is decided in saem_fit AFTER
     // the initial hard classification -- see below.)
     DEBUG=as<int>(x["DEBUG"]);
@@ -3134,7 +3546,10 @@ public:
     _seedLayout.nmc = (uint64_t)nmc;
     _seedLayout.ntotal = (uint64_t)ntotal;
     // the draws own every iteration's seeds; the solves take the sequence after
-    const uint64_t seedReserved = _seedLayout.iterBase(niter + nSaCov);
+    gradientSeedBase = _seedLayout.iterBase(niter + nSaCov);
+    const uint64_t gradientCount = malaKernel.transitions + hmcKernel.transitions;
+    const uint64_t seedReserved = gradientSeedBase + gradientCount * niter * nM * 2 *
+      (uint64_t)std::max(nMix, 1);
     if (seedReserved > 0xFFFFFFFFull) {
       Rcpp::warning("random draws exceed the seed range; some seeds repeat");
     }
@@ -3338,6 +3753,7 @@ public:
           do_mcmc_msaem(2, nu2, mx, mphi0, phiM, U_y, U_phi, (int)kiter);
           do_mcmc_msaem(3, nu3, mx, mphi0, phiM, U_y, U_phi, (int)kiter);
         }
+        runGradientKernels(kiter, 0, mx, mphi1, mphi0, phiM, U_y);
         if (DEBUG > 0) Rcout << "mcmc successful (msaem)\n";
         if (kiter < (unsigned int)niter) savePhiM(kiter, phiM);
 
@@ -3350,58 +3766,9 @@ public:
         for (int mHyp = 0; mHyp < nMix; mHyp++) {
           current_saem_state->_saemMixest = mHyp + 1;
           mat hypMat = user_fn(phiM, evt, optM);
-          fsave_hyp(mHyp) = hypMat.col(0);
-          vec fHyp = hypMat.col(0);
-          vec censHyp = hypMat.col(1);
-          vec limitHyp = hypMat.col(2);
-          cens_hyp(mHyp) = censHyp;
-          limit_hyp(mHyp) = limitHyp;
-          mat DYFhyp = zeros<mat>(mlen, nM);
-          if (distribution == 1) {
-            vec yt = hasFixedObsTransform ? yTrans : y;
-            if (!hasFixedObsTransform) {
-              for (int i = ntotal; i--;) {
-                int cur = ix_endpnt(i);
-                yt(i) = _powerD(y(i), lambda(cur), yj(cur), low(cur), hi(cur));
-              }
-            }
-            const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-            for (int k = 0; k < nmc; k++) {
-              int obs_start = k * ntotal;
-              vec fk = fHyp.subvec(obs_start, obs_start + ntotal - 1);
-              const vec censk = censHyp.subvec(obs_start, obs_start + ntotal - 1);
-              const vec limitk = limitHyp.subvec(obs_start, obs_start + ntotal - 1);
-              _scratch_ft = fk;
-              _scratch_limitT = limitk;
-              for (int i = ntotal; i--;) {
-                int cur = ix_endpnt(i);
-                _scratch_limitT(i) = _powerD(limitk(i), lambda(cur), yj(cur), low(cur), hi(cur));
-                _scratch_ft(i) = _powerD(fk(i), lambda(cur), yj(cur), low(cur), hi(cur));
-                _scratch_ftT(i) = handleF(propT(cur), _scratch_ft(i), fk(i), false, true);
-              }
-              saemFormG(_scratch_g, vecares, vecbres, _scratch_ftT, veccres, vecaddProp);
-              _scratch_g.elem(find(_scratch_g == 0.0)).fill(1.0);
-              _scratch_g.elem(find(_scratch_g < double_xmin)).fill(double_xmin);
-              _scratch_g.elem(find(_scratch_g > xmax)).fill(xmax);
-              _scratch_indio = indio + (arma::uword)k * stride;
-              DYFhyp(_scratch_indio) = arDYFhyp(yt, _scratch_ft, _scratch_g);
-              applyCensLoss(DYFhyp, _scratch_indio, censk, yt, _scratch_limitT,
-                            _scratch_ftAr, _scratch_gAr);
-            }
-          } else if (distribution == 2) {
-            for (int k = 0; k < nmc; k++) {
-              vec fk = fHyp.subvec(k * ntotal, (k + 1) * ntotal - 1);
-              uvec indio_k = indio + (arma::uword)k * (arma::uword)(N * mlen);
-              DYFhyp(indio_k) = -y % log(fk) + fk;
-            }
-          } else if (distribution == 3) {
-            for (int k = 0; k < nmc; k++) {
-              vec fk = fHyp.subvec(k * ntotal, (k + 1) * ntotal - 1);
-              uvec indio_k = indio + (arma::uword)k * (arma::uword)(N * mlen);
-              DYFhyp(indio_k) = -y % log(fk) - (1 - y) % log(1 - fk);
-            }
-          }
-          vec U_y_hyp = sum(DYFhyp, 0).t();
+          mat losses(mlen, nM, fill::zeros);
+          vec U_y_hyp = scoreMcmc(hypMat, mx, losses, fsave_hyp(mHyp),
+                                  cens_hyp(mHyp), limit_hyp(mHyp));
           for (int i = 0; i < N; i++) {
             double sumL = 0.0;
             for (int k = 0; k < nmc; k++) sumL += U_y_hyp(i + k * N);
@@ -3561,65 +3928,11 @@ public:
           mat &cur_DYF = DYF_mix(jMix);
           cur_DYF.zeros(mlen, nM);
 
-          // Re-solve the chain's current state: the M-step resets the phi0
-          // columns to the population value (and regress solves each subject
-          // under its own component), so the cached predictions are stale and
-          // a stale U_y can freeze the chain at a state that no longer fits.
-          {
-            mat curMat = user_fn(cur_phiM, mixProbRegress ? mx.evtM : evt,
-                                 mixProbRegress ? mx.optM : optM);
-            cur_fsave = curMat.col(0);
-            cur_cens = curMat.col(1);
-            cur_limit = curMat.col(2);
-          }
-          vec f = cur_fsave;
-
-          if (distribution == 1) {
-            vec yt = hasFixedObsTransform ? yTrans : y;
-            if (!hasFixedObsTransform) {
-              for (int i = ntotal; i--;) {
-                int cur = ix_endpnt(i);
-                yt(i) = _powerD(y(i), lambda(cur), yj(cur), low(cur), hi(cur));
-              }
-            }
-            const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-            for (int k = 0; k < nmc; k++) {
-              int obs_start = k * ntotal;
-              vec fk = f.subvec(obs_start, obs_start + ntotal - 1);
-              const vec censk = cur_cens.subvec(obs_start, obs_start + ntotal - 1);
-              const vec limitk = cur_limit.subvec(obs_start, obs_start + ntotal - 1);
-              _scratch_ft = fk;
-              _scratch_limitT = limitk;
-              for (int i = ntotal; i--;) {
-                int cur = ix_endpnt(i);
-                _scratch_limitT(i) = _powerD(limitk(i), lambda(cur), yj(cur), low(cur), hi(cur));
-                _scratch_ft(i) = _powerD(fk(i), lambda(cur), yj(cur), low(cur), hi(cur));
-                _scratch_ftT(i) = handleF(propT(cur), _scratch_ft(i), fk(i), false, true);
-              }
-              saemFormG(_scratch_g, vecares, vecbres, _scratch_ftT, veccres, vecaddProp);
-              _scratch_g.elem(find(_scratch_g == 0.0)).fill(1.0);
-              _scratch_g.elem(find(_scratch_g < double_xmin)).fill(double_xmin);
-              _scratch_g.elem(find(_scratch_g > xmax)).fill(xmax);
-              _scratch_indio = indio + (arma::uword)k * stride;
-              cur_DYF(_scratch_indio) = arDYFhyp(yt, _scratch_ft, _scratch_g);
-              applyCensLoss(cur_DYF, _scratch_indio, censk, yt, _scratch_limitT,
-                            _scratch_ftAr, _scratch_gAr);
-            }
-          } else if (distribution == 2) {
-            for (int k = 0; k < nmc; k++) {
-              vec fk = f.subvec(k * ntotal, (k + 1) * ntotal - 1);
-              uvec indio_k = indio + (arma::uword)k * (arma::uword)(N * mlen);
-              cur_DYF(indio_k) = -y % log(fk) + fk;
-            }
-          } else if (distribution == 3) {
-            for (int k = 0; k < nmc; k++) {
-              vec fk = f.subvec(k * ntotal, (k + 1) * ntotal - 1);
-              uvec indio_k = indio + (arma::uword)k * (arma::uword)(N * mlen);
-              cur_DYF(indio_k) = -y % log(fk) - (1 - y) % log(1 - fk);
-            }
-          }
-
-          vec U_y = sum(cur_DYF, 0).t();
+          // The previous M-step may have replaced the chain's phi0 columns.
+          // Rescore the retained state before any transition.
+          const mat curMat = user_fn(cur_phiM, mixProbRegress ? mx.evtM : evt,
+                                     mixProbRegress ? mx.optM : optM);
+          vec U_y = scoreMcmc(curMat, mx, cur_DYF, cur_fsave, cur_cens, cur_limit);
           penAddSubj(cur_phiM, U_y);
 
           if (nphi1 > 0) {
@@ -3638,6 +3951,9 @@ public:
             do_mcmc(2, nu2, mx, mphi0, cur_DYF, cur_phiM, U_y, U_phi, cur_fsave, cur_cens, cur_limit, (int)kiter, jMix + 1);
             do_mcmc(3, nu3, mx, mphi0, cur_DYF, cur_phiM, U_y, U_phi, cur_fsave, cur_cens, cur_limit, (int)kiter, jMix + 1);
           }
+
+          runGradientKernels(kiter, jMix, mx, mphi1, mphi0, cur_phiM, U_y,
+                             &cur_fsave, &cur_cens, &cur_limit);
 
           // Joint NLL (U_y + U_phi) for mixture weights: U_y alone is insufficient since MCMC
           // adapts eta to fit every component equally; the prior penalty U_phi (Mahalanobis
@@ -3994,6 +4310,7 @@ public:
           do_mcmc(2, nu2, mx, mphi0, DYF, phiM, U_y, U_phi, fsave, cens, limit, (int)kiter);
           do_mcmc(3, nu3, mx, mphi0, DYF, phiM, U_y, U_phi, fsave, cens, limit, (int)kiter);
         }
+        runGradientKernels(kiter, 0, mx, mphi1, mphi0, phiM, U_y, &fsave, &cens, &limit);
         if (DEBUG>0) Rcout << "mcmc successful\n";
         // close this iteration's mixing diagnostics, after the whole MCMC
         // block, so they describe the chain the M-step is about to use
@@ -4201,6 +4518,10 @@ public:
         if (fixedIx0.n_elem>0) {
           Plambda0(fixedIx0) = MCOV0(jcov0(fixedIx0));
         }
+        if (optM.containsElementNamed("phi0Joint") && nonMuThetaOptType == 3 &&
+            kiter >= (unsigned int)niter_phi0) {
+          Plambda0 = MCOV0(jcov0);
+        }
         // the shared-eta component thetas follow their recentering exactly
         for (unsigned int o = 0; o < mixOwn0.n_elem; o++) {
           Plambda0(mixOwnLam0(o)) = mixOwnTheta(o);
@@ -4234,7 +4555,7 @@ public:
       // (kiter>=niter_phi0), do NOT overwrite mprior_phi0 with the stochastic
       // sampled-mean update -- that fights the optimizer and lets phi0 drift.
       // The optimizer result from the previous iteration persists as the seed.
-      bool skipStochPhi0 = nonMuThetaRegress && (distribution != 4) &&
+      bool skipStochPhi0 = nMix <= 1 && nonMuThetaRegress && (distribution != 4) &&
         (kiter >= (unsigned int)niter_phi0);
       if (!skipStochPhi0) {
         mprior_phi0=COV0*MCOV0;
@@ -4262,10 +4583,16 @@ public:
       // nonMuThetaEvery>1 refines only every k-th iteration; mprior_phi0 holds its
       // last refined value in between (the SA step pas(kiter) moves it a fraction
       // of one optimizer step anyway, so refining every iteration buys little).
+      bool jointResid = false;
       if ((distribution == 4 || nonMuThetaRegress) &&
           nphi0 > 0 && kiter >= (unsigned int)niter_phi0 &&
           (kiter - (unsigned int)niter_phi0) % (unsigned int)nonMuThetaEvery == 0) {
-        refinePhi0Lik(kiter, pas);
+        jointResid = refinePhi0Lik(kiter, pas) && distribution == 1;
+      } else if (nonMuThetaOptType == 3 && nonMuThetaRegress && nphi0 == 0 &&
+                 pas(kiter) > 0 && kiter >= (unsigned int)niter_phi0 &&
+                 (kiter - (unsigned int)niter_phi0) % (unsigned int)nonMuThetaEvery == 0) {
+        jointResid = refinePhi0Joint(pas(kiter), kiter) && distribution == 1;
+        if (!jointResid) ++phi0FisherFallback;
       }
       // once the refinement owns phi0 the model runs at mprior_phi0, so report
       // that rather than the pre-refinement regression estimate
@@ -4409,11 +4736,11 @@ public:
         // AR(1): update the correlation from this iteration's residual pairs
         // (grid-search profile likelihood + stochastic approximation).  statrese
         // already holds the whitened SSR, so sig2 below is the marginal variance.
-        if (arActive(b)) arUpdateCor(b, kiter, pas);
+        if (!jointResid && arActive(b)) arUpdateCor(b, kiter, pas);
         double sig2=statrese[b]/(y_offset(b+1)-y_offset(b));       //CHK: range
         int offsetR = res_offset[b];
         _saemFixedIdx[0] = _saemFixedIdx[1] = _saemFixedIdx[2] = _saemFixedIdx[3] = 0;
-        switch (res_mod(b)) {
+        if (!jointResid) switch (res_mod(b)) {
         case rmAdd:
           {
             if (resFixed[offsetR] == 1 && kiter > (unsigned int)(nb_fixResid)) {
@@ -5028,7 +5355,9 @@ public:
           }
           break;
         }
-        sigma2[b] = sig2;                                          //CHK: sigma2[] use
+        if (jointResid && res_mod(b) == rmAdd) sig2 = ares(b)*ares(b);
+        if (jointResid && res_mod(b) == rmProp) sig2 = bres(b)*bres(b);
+        sigma2[b] = sig2;
         if (sigma2[b]>1.0e99) sigma2[b] = 1.0e99;
         if (std::isnan(sigma2[b])) sigma2[b] = 1.0e99;
       }
@@ -5249,6 +5578,16 @@ private:
   int niter;
   int saemSeed = 99;
   saemSeedLayout _seedLayout;
+  struct GradientKernel {
+    double step = 0;
+    int steps = 1;
+    uword transitions = 0;
+    uword accepted = 0;
+    uword proposed = 0;
+  };
+  GradientKernel malaKernel, hmcKernel;
+  uint64_t gradientSeedBase = 0;
+  bool gradientUsedAnalytic = false, gradientUsedNumerical = false;
   int nPhase1;
   // uninformative-eta revisit: re-run the informativeness test at the end of burn-in
   // (see revisitUninformativeEtas).  ueRevisitIter < 0 disables it.
@@ -5266,6 +5605,7 @@ private:
   int nb_fixResid;
   int niter_phi0;
   double coef_phi0;
+  vec phi0CoefLower, phi0CoefUpper;
   vec phi0Lower;
   vec phi0Upper;
   double rmcmc;
@@ -5329,6 +5669,7 @@ private:
   // likelihood penalty (likPenalty.h): Plambda index -> ui theta (or -1), the
   // natural ui thetas the callbacks see, and the active phi1 MCMC block
   std::vector<int> _penMap;
+  ivec penResMap;
   std::vector<int> _penEtaOrd;
   std::vector<double> _penTheta;
   const mcmcphi *_penMphi1 = NULL;
@@ -5734,7 +6075,8 @@ private:
   // Subject penalty LL for subject id at phi1 deviations e1 (phi1 slot order).
   // The ABI orders etas as ini() does: phi1 slot q holds eta k when
   // _penEtaOrd[k] == q.
-  double penSubjLL(int id, const double *e1, int nq, int nobs) {
+  double penSubjLL(int id, const double *e1, int nq, int nobs,
+                   const std::vector<double> *atTheta = nullptr) {
     const bool reord = !_penEtaOrd.empty();
     const int ne = reord ? (int)_penEtaOrd.size() : nq;
     std::vector<double> eta((size_t)std::max(ne, 1));
@@ -5742,8 +6084,8 @@ private:
       int q = reord ? _penEtaOrd[(size_t)k] : k;
       eta[(size_t)k] = (q >= 0 && q < nq) ? e1[q] : 0.0;
     }
-    const int nt = (int)_penTheta.size();
-    return nlmixrPenSubjAll(id, ne, nobs, eta.data(), nt, nt > 0 ? _penTheta.data() : NULL, NULL);
+    const auto &theta = atTheta ? *atTheta : _penTheta;
+    return nlmixrPenSubjAll(id, ne, nobs, eta.data(), theta.size(), theta.empty() ? nullptr : theta.data(), NULL);
   }
 
   void penAddSubjEta(const mat &phiMc, vec &U) {
@@ -5887,6 +6229,264 @@ private:
     return 0.0;
   }
 
+  vec scoreMcmc(const mat &fcMat, const mcmcaux &mx, mat &DYF, vec &fs,
+                 vec &cur_cens, vec &cur_limit, mat *score = nullptr) {
+    const double double_xmin = 1e-200;
+    const double xmax = 1e300;
+    if (score) score->zeros(mx.nM, fcMat.n_cols - 3);
+    cur_limit = fcMat.col(2);
+    cur_cens = fcMat.col(1);
+
+    fs = fcMat.col(0);
+    switch (distribution) {
+    case 1:
+      {
+        // Build yt once: does not depend on chain index k
+        vec yt = hasFixedObsTransform ? yTrans : mx.y;
+        if (!hasFixedObsTransform) {
+          for (int i = ntotal; i--;) {
+            int cur = ix_endpnt(i);
+            yt(i) = _powerD(mx.y(i), lambda(cur), yj(cur), low(cur), hi(cur));
+          }
+        }
+        const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
+        for (int k = 0; k < nmc; k++) {
+          int obs_start = k * ntotal;
+          vec fsk = fs.subvec(obs_start, obs_start + ntotal - 1);
+          const vec limitk = cur_limit.subvec(obs_start, obs_start + ntotal - 1);
+          const vec censk = cur_cens.subvec(obs_start, obs_start + ntotal - 1);
+          _scratch_ft = fsk;
+          _scratch_limitT = limitk;
+          for (int i = ntotal; i--;) {
+            int cur = ix_endpnt(i);
+            _scratch_limitT(i) = _powerD(limitk(i), lambda(cur), yj(cur), low(cur), hi(cur));
+            _scratch_ft(i) = _powerD(fsk(i), lambda(cur), yj(cur), low(cur), hi(cur));
+            _scratch_ftT(i) = handleF(propT(cur), _scratch_ft(i), fsk(i), false, true);
+          }
+          saemFormG(_scratch_g, vecares, vecbres, _scratch_ftT, veccres, vecaddProp);
+          _scratch_g.elem(find(_scratch_g == 0.0)).fill(1);
+          _scratch_g.elem(find(_scratch_g < double_xmin)).fill(double_xmin);
+          _scratch_g.elem(find(_scratch_g > xmax)).fill(xmax);
+          _scratch_indio = mx.indio + (arma::uword)k * stride;
+          DYF(_scratch_indio) = arDYFhyp(yt, _scratch_ft, _scratch_g);
+          if (score) {
+            const vec standardized = (yt - _scratch_ft) / _scratch_g;
+            for (int j = 0; j < ntotal; ++j) {
+              const double rawSd = vecares(j) + vecbres(j) * std::abs(_scratch_ftT(j));
+              const double slope = (fsk(j) != 0.0 && rawSd >= double_xmin && rawSd <= xmax)
+                ? std::copysign(vecbres(j), fsk(j)) : 0.0;
+              const double z = standardized(j);
+              const double weight = (z + (z*z - 1.0) * slope) / _scratch_g(j);
+              const uword subject = k * N + mx.indio(j) / mlen;
+              score->row(subject) += weight * fcMat.row(obs_start + j).cols(3, fcMat.n_cols - 1);
+            }
+          }
+          applyCensLoss(DYF, _scratch_indio, censk, yt, _scratch_limitT,
+                        _scratch_ftAr, _scratch_gAr);
+        }
+      }
+      break;
+    case 2:
+      {
+        const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
+        for (int k = 0; k < nmc; k++) {
+          vec fck = fs.subvec(k * ntotal, (k + 1) * ntotal - 1);
+          _scratch_indio = mx.indio + (arma::uword)k * stride;
+          DYF(_scratch_indio) = -mx.y % log(fck) + fck;
+        }
+      }
+      break;
+    case 3:
+      {
+        const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
+        for (int k = 0; k < nmc; k++) {
+          vec fck = fs.subvec(k * ntotal, (k + 1) * ntotal - 1);
+          _scratch_indio = mx.indio + (arma::uword)k * stride;
+          DYF(_scratch_indio) = -mx.y % log(fck) - (1 - mx.y) % log(1 - fck);
+        }
+      }
+      break;
+    case 4:
+      {
+        // general log-likelihood: model prediction is the per-obs loglik
+        const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
+        // Case 1 (closed-form normal/etc.) clamps its own scale (g) to
+        // [double_xmin, xmax] before scoring, specifically so a candidate
+        // that collapses the residual scale toward zero cannot blow up
+        // that observation's contribution -- log N(x;mu,sigma) -> +Inf as
+        // sigma -> 0.  A general-likelihood fck IS the log-likelihood
+        // already (no separate scale to clamp), so it needs the same kind
+        // of finite ceiling directly, or a scale-collapsing candidate
+        // (e.g. driving Vc, and hence cp=centr/Vc, toward 0 in a
+        // proportional-error MM model) gets an unboundedly large reward
+        // and the acceptance test (deltu < -log(accU)) takes it almost
+        // unconditionally.  (Checked directly for the U009 MM corpus
+        // model's own divergence: this clamp never actually fires there,
+        // so it is not what drives that specific case -- it is still a
+        // real, principled gap for models where a candidate genuinely
+        // does collapse the residual scale, and mirrors case 1's own
+        // clamp on structural grounds, not as an attempted fix for U009.)
+        // saemReadRowsPooled also flags a failed/NaN solve with the
+        // shared +1e99 sentinel (see its own comment): for every OTHER
+        // distribution fc is a predicted VALUE compared against data, so
+        // a huge fc naturally penalizes a bad solve via the residual --
+        // here fc IS the log-likelihood, so left unrecognized the
+        // sentinel flows into DYF=-fck as an unboundedly NEGATIVE (i.e.
+        // rewarded) contribution, exactly backwards. Detect and invert it
+        // to a strongly penalized value before applying the ceiling.
+        for (int k = 0; k < nmc; k++) {
+          vec fck = fs.subvec(k * ntotal, (k + 1) * ntotal - 1);
+          fck.elem(find(fck >= 1.0e99)).fill(_saemGenLikBadSolvePenalty);
+          fck.elem(find(fck > _saemGenLikCeiling)).fill(_saemGenLikCeiling);
+          _scratch_indio = mx.indio + (arma::uword)k * stride;
+          DYF(_scratch_indio) = -fck;
+        }
+      }
+      break;
+    }
+
+    return sum(DYF, 0).t();
+  }
+
+  // Use the same conditional observation loss as the ordinary SAEM kernels.
+  // The MSAEM chain marginalizes over classes and already includes penalties.
+  vec gradientObsLoss(const mat &phi, const mcmcaux &mx, mat &evaluated,
+                       mat &work, bool marginal, mat *score = nullptr) {
+    if (marginal) return mixObsLoss(phi, mx);
+    evaluated = nmRngGuard([&]{ return user_fn(phi, mx.evtM, mx.optM); });
+    vec f, censor, limit;
+    vec loss = scoreMcmc(evaluated, mx, work, f, censor, limit, score);
+    penAddSubj(phi, loss);
+    return loss;
+  }
+
+  vec scoreGradientState(const mat &phi, const mcmcaux &mx, const mcmcphi &block,
+                         const mat &mask, mat &evaluated, mat &work, bool marginal,
+                         bool analytic, mat &gradient, vec &obsLoss) {
+    mat score;
+    obsLoss = gradientObsLoss(phi, mx, evaluated, work, marginal, analytic ? &score : nullptr);
+    mat force;
+    if (analytic) {
+      gradientUsedAnalytic = true;
+      force = score.cols(block.i);
+    } else {
+      gradientUsedNumerical = true;
+      force.zeros(phi.n_rows, block.i.n_elem);
+      mat probe = phi, ignored;
+      const double relativeStep = std::pow(DBL_EPSILON, 0.25);
+      for (uword c = 0; c < block.i.n_elem; ++c) {
+        if (!any(mask.col(c) != 0)) continue;
+        const uword col = block.i(c);
+        const vec x = phi.col(col);
+        const vec step = relativeStep * (1.0 + abs(x));
+        probe.col(col) = x + step % mask.col(c);
+        const vec plus = gradientObsLoss(probe, mx, ignored, work, marginal);
+        probe.col(col) = x - step % mask.col(c);
+        const vec minus = gradientObsLoss(probe, mx, ignored, work, marginal);
+        probe.col(col) = x;
+        vec derivative = (minus - plus) / (2.0 * step);
+        derivative.elem(find_nonfinite(derivative)).zeros();
+        force.col(c) = derivative;
+      }
+    }
+    const mat centered = phi.cols(block.i) - block.mprior_phiM;
+    const mat priorGradient = centered * block.IGamma2_phi;
+    // Mask the model-space displacement and its pullback together. A subject
+    // with some fixed coordinates can still move in every free coordinate.
+    force -= priorGradient;
+    force.elem(find_nonfinite(force)).zeros();
+    gradient = (force % mask) * block.Gamma_phi.t();
+    return obsLoss + 0.5 * sum(centered % priorGradient, 1);
+  }
+
+  void gradientTransition(const mcmcaux &mx, const mcmcphi &block, mat &phi,
+                          vec &obsLoss, mat &current, GradientKernel &kernel,
+                          uint64_t seedOffset, bool marginal, bool analytic,
+                          const mat &mask, mat &work) {
+    const uvec masked = find(all(mask == 0, 1));
+    kernel.proposed += phi.n_rows - masked.n_elem;
+    if (masked.n_elem == phi.n_rows) return;
+
+    mat gradient;
+    const vec energy = scoreGradientState(phi, mx, block, mask, current, work,
+                                           marginal, analytic, gradient, obsLoss);
+    uvec inactive = unique(join_cols(masked, find_nonfinite(energy + sum(abs(gradient), 1))));
+    if (inactive.n_elem == phi.n_rows) return;
+
+    mat startMomentum(phi.n_rows, block.i.n_elem);
+    vec uniform(phi.n_rows);
+    _saemDrawRows(saemSeed, seedOffset, startMomentum, uniform);
+    mat momentum = startMomentum;
+    mat proposal = phi, evaluated;
+    vec proposedEnergy, proposedLoss;
+    for (int i = 0; i < kernel.steps; ++i) {
+      gradient.rows(inactive).zeros();
+      momentum += (0.5 * kernel.step) * gradient;
+      mat delta = (kernel.step * momentum * block.Gamma_phi) % mask;
+      const mat next = proposal.cols(block.i) + delta;
+      inactive = unique(join_cols(inactive, find_nonfinite(sum(abs(next), 1))));
+      if (inactive.n_elem == phi.n_rows) return;
+      delta.rows(inactive).zeros();
+      proposal.cols(block.i) += delta;
+      proposedEnergy = scoreGradientState(proposal, mx, block, mask, evaluated, work,
+                                          marginal, analytic, gradient, proposedLoss);
+      inactive = unique(join_cols(inactive, find_nonfinite(proposedEnergy + sum(abs(gradient), 1))));
+      if (inactive.n_elem == phi.n_rows) return;
+      gradient.rows(inactive).zeros();
+      momentum += (0.5 * kernel.step) * gradient;
+    }
+    vec ratio = energy - proposedEnergy +
+      0.5 * (sum(square(startMomentum), 1) - sum(square(momentum), 1));
+    ratio.elem(find_nonfinite(ratio)).fill(-datum::inf);
+    ratio.elem(inactive).fill(-datum::inf);
+    const uvec accepted = find(log(uniform) < ratio);
+    if ((int)mcmcAccById.n_elem != N) mcmcAccById.zeros(N);
+    for (uword row : accepted) ++mcmcAccById(row % N);
+    phi(accepted, block.i) = proposal(accepted, block.i);
+    obsLoss.elem(accepted) = proposedLoss.elem(accepted);
+    if (!marginal) {
+      const uvec observations = getObsIdx(ix_idM.rows(accepted));
+      current.rows(observations) = evaluated.rows(observations);
+    }
+    kernel.accepted += accepted.n_elem;
+  }
+
+  void runGradientKernels(unsigned int iter, int component, const mcmcaux &mx,
+                          const mcmcphi &effects, const mcmcphi &fixedEffects,
+                          mat &phi, vec &loss, vec *pred = nullptr,
+                          vec *censor = nullptr, vec *limit = nullptr) {
+    const uint64_t count = malaKernel.transitions + hmcKernel.transitions;
+    if (!count || iter >= (unsigned int)niter) return;
+    const bool marginal = pred == nullptr;
+    const bool analytic = !marginal && distribution == 1 && !hasAr &&
+      nendpnt == 1 && (res_mod(0) == rmAdd || res_mod(0) == rmProp) && yj(0) == 2 &&
+      !nlmixrPenNPop() && !nlmixrPenNSubject() && mx.optM.containsElementNamed("scoreLhs");
+    mat current, work(mlen, nM, fill::zeros);
+    bool sampled = false;
+    for (int b = 0; b < 2; ++b) {
+      const mcmcphi &block = b == 0 ? effects : fixedEffects;
+      // Standard kernels already sample phi0 in a mixed schedule. A
+      // gradient-only schedule must sample it too.
+      if (block.nphi == 0 || (b == 1 && effects.nphi && accu(nu.head(3)) > 0)) continue;
+      const mat mask = current_saem_state->_saemUE.cols(block.i);
+      if (!any(vectorise(mask) != 0)) continue;
+      sampled = true;
+      const uint64_t lane = (uint64_t)iter * 2 * std::max(nMix, 1) + 2 * component + b;
+      uint64_t next = gradientSeedBase + lane * count * nM;
+      for (auto *kernel : {&malaKernel, &hmcKernel}) {
+        for (uword sweep = 0; sweep < kernel->transitions; ++sweep, next += nM) {
+          gradientTransition(mx, block, phi, loss, current, *kernel, next,
+                             marginal, analytic, mask, work);
+        }
+      }
+    }
+    if (sampled && !marginal && current.n_cols >= 3) {
+      *pred = current.col(0);
+      *censor = current.col(1);
+      *limit = current.col(2);
+    }
+  }
+
   void do_mcmc(const int method,
                const int nu,
                const mcmcaux &mx,
@@ -5901,13 +6501,11 @@ private:
                int kiter,
                int mixIdx = 0) {
     mat fcMat;
-    vec fc, fs, Uc_y, Uc_phi, deltu;
+    vec fs, Uc_y, Uc_phi, deltu;
     uvec ind;
     arma::vec accU(mx.nM);   // per-block threefry acceptance uniforms
 
     uvec i=mphi.i;
-    double double_xmin = 1.0e-200;                               //FIXME hard-coded xmin, also in neldermean.hpp
-    double xmax = 1e300;
     for (int u=0; u<nu; u++)
       for (int k1=0; k1<mphi.nphi; k1++) {
         mat phiMc=phiM;
@@ -5936,107 +6534,7 @@ private:
         }
 
         fcMat = nmRngGuard([&]{ return user_fn(phiMc, mx.evtM, mx.optM); });
-        cur_limit = fcMat.col(2);
-        cur_cens = fcMat.col(1);
-
-        fc = fcMat.col(0);
-        fs = fc;
-        switch (distribution) {
-        case 1:
-          {
-            // Build yt once: does not depend on chain index k
-            vec yt = hasFixedObsTransform ? yTrans : mx.y;
-            if (!hasFixedObsTransform) {
-              for (int i = ntotal; i--;) {
-                int cur = ix_endpnt(i);
-                yt(i) = _powerD(mx.y(i), lambda(cur), yj(cur), low(cur), hi(cur));
-              }
-            }
-            const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-            for (int k = 0; k < nmc; k++) {
-              int obs_start = k * ntotal;
-              vec fsk = fs.subvec(obs_start, obs_start + ntotal - 1);
-              const vec limitk = cur_limit.subvec(obs_start, obs_start + ntotal - 1);
-              const vec censk = cur_cens.subvec(obs_start, obs_start + ntotal - 1);
-              _scratch_ft = fsk;
-              _scratch_limitT = limitk;
-              for (int i = ntotal; i--;) {
-                int cur = ix_endpnt(i);
-                _scratch_limitT(i) = _powerD(limitk(i), lambda(cur), yj(cur), low(cur), hi(cur));
-                _scratch_ft(i) = _powerD(fsk(i), lambda(cur), yj(cur), low(cur), hi(cur));
-                _scratch_ftT(i) = handleF(propT(cur), _scratch_ft(i), fsk(i), false, true);
-              }
-              saemFormG(_scratch_g, vecares, vecbres, _scratch_ftT, veccres, vecaddProp);
-              _scratch_g.elem(find(_scratch_g == 0.0)).fill(1);
-              _scratch_g.elem(find(_scratch_g < double_xmin)).fill(double_xmin);
-              _scratch_g.elem(find(_scratch_g > xmax)).fill(xmax);
-              _scratch_indio = mx.indio + (arma::uword)k * stride;
-              DYF(_scratch_indio) = arDYFhyp(yt, _scratch_ft, _scratch_g);
-              applyCensLoss(DYF, _scratch_indio, censk, yt, _scratch_limitT,
-                            _scratch_ftAr, _scratch_gAr);
-            }
-          }
-          break;
-        case 2:
-          {
-            const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-            for (int k = 0; k < nmc; k++) {
-              vec fck = fc.subvec(k * ntotal, (k + 1) * ntotal - 1);
-              _scratch_indio = mx.indio + (arma::uword)k * stride;
-              DYF(_scratch_indio) = -mx.y % log(fck) + fck;
-            }
-          }
-          break;
-        case 3:
-          {
-            const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-            for (int k = 0; k < nmc; k++) {
-              vec fck = fc.subvec(k * ntotal, (k + 1) * ntotal - 1);
-              _scratch_indio = mx.indio + (arma::uword)k * stride;
-              DYF(_scratch_indio) = -mx.y % log(fck) - (1 - mx.y) % log(1 - fck);
-            }
-          }
-          break;
-        case 4:
-          {
-            // general log-likelihood: model prediction is the per-obs loglik
-            const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-            // Case 1 (closed-form normal/etc.) clamps its own scale (g) to
-            // [double_xmin, xmax] before scoring, specifically so a candidate
-            // that collapses the residual scale toward zero cannot blow up
-            // that observation's contribution -- log N(x;mu,sigma) -> +Inf as
-            // sigma -> 0.  A general-likelihood fck IS the log-likelihood
-            // already (no separate scale to clamp), so it needs the same kind
-            // of finite ceiling directly, or a scale-collapsing candidate
-            // (e.g. driving Vc, and hence cp=centr/Vc, toward 0 in a
-            // proportional-error MM model) gets an unboundedly large reward
-            // and the acceptance test (deltu < -log(accU)) takes it almost
-            // unconditionally.  (Checked directly for the U009 MM corpus
-            // model's own divergence: this clamp never actually fires there,
-            // so it is not what drives that specific case -- it is still a
-            // real, principled gap for models where a candidate genuinely
-            // does collapse the residual scale, and mirrors case 1's own
-            // clamp on structural grounds, not as an attempted fix for U009.)
-            // saemReadRowsPooled also flags a failed/NaN solve with the
-            // shared +1e99 sentinel (see its own comment): for every OTHER
-            // distribution fc is a predicted VALUE compared against data, so
-            // a huge fc naturally penalizes a bad solve via the residual --
-            // here fc IS the log-likelihood, so left unrecognized the
-            // sentinel flows into DYF=-fck as an unboundedly NEGATIVE (i.e.
-            // rewarded) contribution, exactly backwards. Detect and invert it
-            // to a strongly penalized value before applying the ceiling.
-            for (int k = 0; k < nmc; k++) {
-              vec fck = fc.subvec(k * ntotal, (k + 1) * ntotal - 1);
-              fck.elem(find(fck >= 1.0e99)).fill(_saemGenLikBadSolvePenalty);
-              fck.elem(find(fck > _saemGenLikCeiling)).fill(_saemGenLikCeiling);
-              _scratch_indio = mx.indio + (arma::uword)k * stride;
-              DYF(_scratch_indio) = -fck;
-            }
-          }
-          break;
-        }
-
-        Uc_y=sum(DYF,0).t();
+        Uc_y = scoreMcmc(fcMat, mx, DYF, fs, cur_cens, cur_limit);
         penAddSubj(phiMc, Uc_y);
         if (method==1) {
           deltu=Uc_y-U_y;
@@ -6070,85 +6568,13 @@ private:
   // observation columns are read, so only this loss needs mixture treatment; the prior penalty
   // (in do_mcmc_msaem()) stays a standard single-Gaussian quadratic form.
   vec mixObsLoss(const mat &phiC, const mcmcaux &mx) {
-    double double_xmin = 1.0e-200;
-    double xmax = 1e300;
     mat lossByM(mx.nM, nMix);
+    mat losses(mlen, mx.nM, fill::zeros);
+    vec f, censor, limit;
     for (int mHyp = 0; mHyp < nMix; mHyp++) {
       current_saem_state->_saemMixest = mHyp + 1;
-      mat fcMat = nmRngGuard([&]{ return user_fn(phiC, mx.evtM, mx.optM); });
-      vec curLimit = fcMat.col(2);
-      vec curCens = fcMat.col(1);
-      vec fc = fcMat.col(0);
-      vec fs = fc;
-      mat DYFm = zeros<mat>(mlen, mx.nM);
-      switch (distribution) {
-      case 1:
-        {
-          vec yt = hasFixedObsTransform ? yTrans : mx.y;
-          if (!hasFixedObsTransform) {
-            for (int i = ntotal; i--;) {
-              int cur = ix_endpnt(i);
-              yt(i) = _powerD(mx.y(i), lambda(cur), yj(cur), low(cur), hi(cur));
-            }
-          }
-          const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-          for (int k = 0; k < nmc; k++) {
-            int obs_start = k * ntotal;
-            vec fsk = fs.subvec(obs_start, obs_start + ntotal - 1);
-            const vec limitk = curLimit.subvec(obs_start, obs_start + ntotal - 1);
-            const vec censk = curCens.subvec(obs_start, obs_start + ntotal - 1);
-            _scratch_ft = fsk;
-            _scratch_limitT = limitk;
-            for (int i = ntotal; i--;) {
-              int cur = ix_endpnt(i);
-              _scratch_limitT(i) = _powerD(limitk(i), lambda(cur), yj(cur), low(cur), hi(cur));
-              _scratch_ft(i) = _powerD(fsk(i), lambda(cur), yj(cur), low(cur), hi(cur));
-              _scratch_ftT(i) = handleF(propT(cur), _scratch_ft(i), fsk(i), false, true);
-            }
-            saemFormG(_scratch_g, vecares, vecbres, _scratch_ftT, veccres, vecaddProp);
-            _scratch_g.elem(find(_scratch_g == 0.0)).fill(1);
-            _scratch_g.elem(find(_scratch_g < double_xmin)).fill(double_xmin);
-            _scratch_g.elem(find(_scratch_g > xmax)).fill(xmax);
-            _scratch_indio = mx.indio + (arma::uword)k * stride;
-            DYFm(_scratch_indio) = arDYFhyp(yt, _scratch_ft, _scratch_g);
-            applyCensLoss(DYFm, _scratch_indio, censk, yt, _scratch_limitT,
-                          _scratch_ftAr, _scratch_gAr);
-          }
-        }
-        break;
-      case 2:
-        {
-          const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-          for (int k = 0; k < nmc; k++) {
-            vec fck = fc.subvec(k * ntotal, (k + 1) * ntotal - 1);
-            _scratch_indio = mx.indio + (arma::uword)k * stride;
-            DYFm(_scratch_indio) = -mx.y % log(fck) + fck;
-          }
-        }
-        break;
-      case 3:
-        {
-          const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-          for (int k = 0; k < nmc; k++) {
-            vec fck = fc.subvec(k * ntotal, (k + 1) * ntotal - 1);
-            _scratch_indio = mx.indio + (arma::uword)k * stride;
-            DYFm(_scratch_indio) = -mx.y % log(fck) - (1 - mx.y) % log(1 - fck);
-          }
-        }
-        break;
-      case 4:
-        {
-          // general log-likelihood: model prediction is the per-obs loglik
-          const arma::uword stride = (arma::uword)N * (arma::uword)mlen;
-          for (int k = 0; k < nmc; k++) {
-            vec fck = fc.subvec(k * ntotal, (k + 1) * ntotal - 1);
-            _scratch_indio = mx.indio + (arma::uword)k * stride;
-            DYFm(_scratch_indio) = -fck;
-          }
-        }
-        break;
-      }
-      lossByM.col(mHyp) = sum(DYFm, 0).t();
+      const mat evaluated = nmRngGuard([&]{ return user_fn(phiC, mx.evtM, mx.optM); });
+      lossByM.col(mHyp) = scoreMcmc(evaluated, mx, losses, f, censor, limit);
     }
     current_saem_state->_saemMixest = 0;
 
@@ -6840,7 +7266,9 @@ mat user_function(const mat &_phi, const mat &_evt, const List &_opt) {
   }
   } // end (!_saemFreezeOde) integration guard
   // indTolRelax=TRUE: stiff subjects retain their loosened tolFactor across iterations.
-  mat g(getRxNsim(_rx) * getRxNobs2(_rx), 3); // nobs across all chains
+  uvec scoreLhs;
+  if (_opt.containsElementNamed("scoreLhs")) scoreLhs = as<uvec>(_opt["scoreLhs"]);
+  mat g(getRxNsim(_rx) * getRxNobs2(_rx), 3 + scoreLhs.n_elem);
   int elt=0;
   bool hasNan = false;
   if (_saemPhi1PoolActive) {
@@ -6880,6 +7308,9 @@ mat user_function(const mat &_phi, const mat &_evt, const List &_opt) {
           g(elt, 2) = getIndLimit(ind, kk);
         } else {
           g(elt, 2) = R_NegInf;
+        }
+        for (uword j = 0; j < scoreLhs.n_elem; ++j) {
+          g(elt, 3 + j) = std::isfinite(lhs[0]) ? lhs[scoreLhs(j)] : datum::nan;
         }
         elt++;
       } // evid=2 does not need to be calculated
@@ -7087,6 +7518,16 @@ SEXP saem_fit(SEXP xSEXP) {
     Named("etaModeConv") = saem.get_etaModeConv(),
     Named("plateauIter") = saem.get_plateauIter()
   );
+  out["phi0OptimizerCounts"] = saem.phi0OptimizerCounts();
+  const char *score = saem.gradientScoreMethod();
+  if (saem.hasGradientKernel(false)) {
+    out["malaCounts"] = saem.getGradientCounts(false);
+    out["malaScore"] = score;
+  }
+  if (saem.hasGradientKernel(true)) {
+    out["hmcCounts"] = saem.getGradientCounts(true);
+    out["hmcScore"] = score;
+  }
   current_saem_state = nullptr;
   int nModeFail = (int)accu(saem.get_etaModeConv() < 0);
   if (nModeFail > 0) {

@@ -27,21 +27,28 @@
 #'     MC method will be more accurate at the cost of more
 #'     computation.  In Monolix this is equivalent to \code{L}.
 #'
-#' @param nu This is a vector of 3 integers. They represent the
-#'     numbers of transitions of the three different kernels used in
-#'     the Hasting-Metropolis algorithm.  The default value is \code{c(2,2,2)},
-#'     representing 40 for each transition initially (each value is
-#'     multiplied by 20).  When unset, a residual error model that depends on
-#'     an eta uses \code{c(4,4,4)}, since its chains mix more slowly.
-#'
-#'     The first value represents the initial number of multi-variate
-#'     Gibbs samples are taken from a normal distribution.
-#'
-#'     The second value represents the number of uni-variate, or multi-
-#'     dimensional random walk Gibbs samples are taken.
-#'
-#'     The third value represents the number of bootstrap/reshuffling or
-#'     uni-dimensional random samples are taken.
+#' @param nu An unnamed vector of three counts, or a named integer vector
+#'     with entries `prior`, `rw`, `coord`, `mala`, and `hmc`.
+#'     Omitted standard counts default to two. The gradient counts give
+#'     transitions per iteration, including the first. They default to zero,
+#'     or one when a positive step size is supplied without an explicit count.
+#'     A positive gradient count with no step size uses 0.1.
+#'     The standard kernels run in order: population-prior independence
+#'     proposals, joint random-walk proposals, and coordinate random-walk
+#'     sweeps. Their counts are multiplied by 20 on the first iteration.
+#'     At least one kernel count must be positive. MALA and HMC run
+#'     afterward, in that order. A gradient-only schedule also samples any
+#'     auxiliary fixed-effect block that SAEM uses.
+#' @param malaStep MALA step size in population-standardized random-effect coordinates.
+#'     The kernel uses the SAEM conditional observation likelihood and Gaussian
+#'     prior. It uses analytic sensitivities when the analytic score is supported
+#'     and central differences of the same target otherwise. It moves the unmasked
+#'     effects and reports counts in \code{fit$env$saem$malaCounts}.
+#' @param hmcStep HMC step size in population-standardized
+#'     coordinates.
+#'     Uses the same score routes as MALA. Pooled counts are available in
+#'     \code{fit$env$saem$hmcCounts}.
+#' @param hmcSteps Number of leapfrog steps per HMC transition.
 #'
 #' @param rmcmc Scale of the random-walk proposals (kernels 2 and 3) relative
 #'     to the current between-subject SD.  Smaller values raise the MCMC
@@ -330,7 +337,15 @@
 #'   objective evaluation is a full re-solve, so this refinement can dominate the
 #'   run time; the multivariate options spend a much smaller fixed budget and
 #'   account for the coupling between coordinates that coordinate descent cannot
-#'   see.
+#'   see. `"fisher"` jointly refines free non-mu structural thetas and residual
+#'   residual parameters on the current SAEM draws and uses the E-step
+#'   responsibilities for mixtures. It supports Gaussian residual models,
+#'   including observation transformations and AR errors, and can optimize
+#'   parameters of the model-provided general likelihood.
+#'   It also supports residual-only refinement. When sensitivities are unavailable
+#'   or Fisher scoring stalls, the existing bounded optimizer can continue on
+#'   the same joint likelihood. Each optimizer has its own
+#'   `nonMuThetaMaxEval` budget.
 #'
 #' @param nonMuThetaSweeps Number of coordinate-descent sweeps per refinement
 #'   for `nonMuThetaOpt="optimize"` (default 2).
@@ -439,6 +454,9 @@ saemControl <- function(
   plateauMinFrac = 0.5,
   nmc = 3,
   nu = c(2, 2, 2),
+  malaStep = 0,
+  hmcStep = 0,
+  hmcSteps = 4L,
   rmcmc = 0.5,
   mcmcAcceptWarn = c(0.05, 0.8),
   print = 1L,
@@ -489,7 +507,7 @@ saemControl <- function(
   mixProbPriorN = 20,
   mixSampleMethod = c("parallel", "msaem"),
   nonMuTheta = c("regress", "eta"),
-  nonMuThetaOpt = c("newuoa", "optimize", "nelderMead"),
+  nonMuThetaOpt = c("newuoa", "optimize", "nelderMead", "fisher"),
   nonMuThetaSweeps = 2L,
   nonMuThetaMaxEval = 25L,
   nonMuThetaTol = .Machine$double.eps^0.25,
@@ -525,7 +543,6 @@ saemControl <- function(
     nEm <- .xtra$mcmc$niter[2]
     checkmate::assertIntegerish(.xtra$mcmc$nmc, len = 1, lower = 1, any.missing = FALSE, .var.name = "mcmc$nmc")
     nmc <- .xtra$mcmc$nmc
-    checkmate::assertIntegerish(.xtra$mcmc$nu, len = 3, lower = 1, any.missing = FALSE, .var.name = "mcmc$nu")
     ## ASSIGNED, not only validated.  saem rebuilds its control from a plain
     ## list through do.call(saemControl, ...) (.saemFamilyControl), which lands
     ## here; without this line nBurn, nEm and nmc survived the rebuild and `nu`
@@ -545,7 +562,26 @@ saemControl <- function(
   checkmate::assertNumber(plateauTol, lower = 0, finite = TRUE)
   checkmate::assertNumber(plateauMinFrac, lower = 0, upper = 1)
   checkmate::assertIntegerish(nmc, any.missing = FALSE, len = 1, lower = 1)
-  checkmate::assertIntegerish(nu, any.missing = FALSE, len = 3, lower = 1)
+  checkmate::assertNumber(malaStep, lower=0, finite=TRUE)
+  checkmate::assertNumber(hmcStep, lower=0, finite=TRUE)
+  checkmate::assertInt(hmcSteps, lower=1)
+  checkmate::assertIntegerish(nu, any.missing=FALSE, min.len=1, lower=0)
+  if (is.null(names(nu))) {
+    checkmate::assertIntegerish(nu, len=3)
+  } else {
+    .schedule <- c(prior=2L, rw=2L, coord=2L, mala=as.integer(malaStep > 0),
+                   hmc=as.integer(hmcStep > 0))
+    if (anyDuplicated(names(nu)) || any(!names(nu) %in% names(.schedule))) {
+      stop("nu names must be unique and drawn from prior, rw, coord, mala, and hmc", call.=FALSE)
+    }
+    .schedule[names(nu)] <- nu
+    nu <- .schedule
+    malaStep <- if (nu[["mala"]] > 0) if (malaStep > 0) malaStep else 0.1 else 0
+    hmcStep <- if (nu[["hmc"]] > 0) if (hmcStep > 0) hmcStep else 0.1 else 0
+  }
+  if (all(nu == 0) && malaStep == 0 && hmcStep == 0) {
+    stop("At least one SAEM kernel count must be positive", call.=FALSE)
+  }
   checkmate::assertNumber(rmcmc, finite = TRUE)
   if (rmcmc <= 0) {
     stop("'rmcmc' must be positive", call. = FALSE)
@@ -742,6 +778,9 @@ saemControl <- function(
     iovXform = iovXform,
     iovMethod = iovMethod,
     boundedTransform = boundedTransform,
+    malaStep = malaStep,
+    hmcStep = hmcStep,
+    hmcSteps = as.integer(hmcSteps),
     eventSens = eventSens,
     mixProbMethod = mixProbMethod,
     mixProbStepExp = mixProbStepExp,

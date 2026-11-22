@@ -497,9 +497,65 @@ rxUiGet.saemParams <- function(x, ...) {
 attr(rxUiGet.saemParams, "desc") <- "Get the params() for a saem model"
 attr(rxUiGet.saemParams, "rstudio") <- "params(tka)"
 
+#' @noRd
+.saemFisherRequested <- function(ui) {
+  .pred <- ui$predDf
+  identical(rxode2::rxGetControl(ui, "nonMuThetaOpt", "newuoa"), "fisher") &&
+    identical(rxode2::rxGetControl(ui, "nonMuTheta", "regress"), "regress") &&
+    nrow(.pred) > 0L
+}
+
 #' @export
-rxUiGet.saemModel <- function(x, ...) {
-  .s <- rxUiGet.loadPruneSaem(x, ...)
+rxUiGet.saemModel <- function(x, ..., .buildScore = TRUE) {
+  .pred <- x[[1]]$predDf
+  .fisherPars <- character()
+  if (.saemFisherRequested(x[[1]]) && all(x[[1]]$saemResMod %in% 1:5) &&
+      !any(x[[1]]$saemArActive != 0L)) {
+    .ini <- x[[1]]$iniDf
+    .fisherPars <- .ini$name[.ini$ntheta %in% .impmapEstTheta(x[[1]])$struct]
+  }
+  .gradient <- (rxode2::rxGetControl(x[[1]], "malaStep", 0) > 0 ||
+                rxode2::rxGetControl(x[[1]], "hmcStep", 0) > 0) &&
+    nrow(.pred) == 1L && identical(as.character(.pred$distribution), "norm") &&
+    identical(as.character(.pred$transform), "untransformed") &&
+    as.character(.pred$errType) %in% c("add", "prop") &&
+    .likPenaltyInfo()[["n"]] == 0L
+  .s <- NULL
+  .scoreLines <- character()
+  .eventJump <- FALSE
+  if (.buildScore && (.gradient || length(.fisherPars))) {
+    .model <- .saemPrune(x)
+    .sens <- tryCatch({
+      .env <- .loadSymengine(.model, promoteLinSens = TRUE)
+      .pars <- rxUiGet.saemParamsToEstimateCov(x, ...)
+      .state <- if (length(.env$..ddt)) .rxode2stateOdeNoOutput(.env) else character()
+      .dirs <- if (.gradient) seq_along(.pars) else which(.pars %in% .fisherPars)
+      .event <- FALSE
+      if (length(.env$..ddt)) {
+        .text <- as.character(.model)
+        if (any(grepl("\\b(delay|lag0|mtime|matExp|indLin)\\s*\\(", .text))) {
+          stop("SAEM state sensitivities are unavailable for this model")
+        }
+        .event <- any(grepl("\\b(alag|f|rate|dur)\\s*\\(", .text))
+        if (.event && !identical(rxode2::rxGetControl(x[[1]], "eventSens", "jump"), "jump")) {
+          stop("SAEM dosing sensitivities require event jumps")
+        }
+      }
+      .env <- .sensEtaOrTheta(.env, directions = .pars[.dirs])
+      .lines <- vapply(.dirs, function(i) {
+        paste0("rx_sg_", i, "=", .rxSensitivityChainRule(.env, "rx_pred_", .pars[[i]], .state))
+      }, character(1))
+      list(env = .env, lines = .lines, eventJump = .event)
+    }, error=function(e) NULL)
+    if (!is.null(.sens)) {
+      .s <- .sens$env
+      .scoreLines <- .sens$lines
+      .eventJump <- .sens$eventJump
+    } else {
+      .s <- .loadSymengine(.model, promoteLinSens = FALSE)
+    }
+  }
+  if (is.null(.s)) .s <- rxUiGet.loadPruneSaem(x, ...)
 
   # matExp(): SAEM has no analytic-sensitivity consumer of the state
   # derivatives (src/saem.cpp has no state-sensitivity machinery), so unlike
@@ -539,12 +595,14 @@ rxUiGet.saemModel <- function(x, ...) {
       #.lhs0,
       .preLhs,
       .ddt,
+      .s$..sens,
       .lagDefs,
       ## DDE non-constant delay() pre-history: base past(state,tau)<-expr.  SAEM is
       ## gradient-free and builds .s without sensitivities, so re-inject the history
       ## (which the symengine interception dropped) from the stored rx__pastRhs_.
       rxode2::.rxPastBaseLinesFromEnv(.s),
       .prd,
+      .scoreLines,
       #.s$..stateInfo["statef"],
       #.s$..stateInfo["dvid"],
       ""
@@ -567,7 +625,10 @@ rxUiGet.saemModel <- function(x, ...) {
   .cmt <- .addPreModelLines(.cmt, rxUiGet.interpLinesStr(x, ...), .mtimeLinesStr(.s))
   ## no splitBolus() here -- saem solves the pre-split $dataSav, so declaring it
   ## would split the doses twice (see .foceiPreProcessData())
-  paste(c(rxUiGet.saemParams(x, ...), .cmt, .ret, .foceiToCmtLinesAndDvid(x[[1]])), collapse = "\n")
+  .text <- paste(c(rxUiGet.saemParams(x, ...), .cmt, .ret, .foceiToCmtLinesAndDvid(x[[1]])), collapse = "\n")
+  if (length(.scoreLines)) attr(.text, "saemHasScore") <- TRUE
+  if (.eventJump) attr(.text, "saemEventJump") <- TRUE
+  .text
 }
 attr(rxUiGet.saemModel, "rstudio") <- "params(tcl)"
 

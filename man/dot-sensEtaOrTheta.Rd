@@ -9,7 +9,8 @@
   theta = FALSE,
   extraThetaVars = NULL,
   rxui = NULL,
-  matExpForcing = TRUE
+  matExpForcing = TRUE,
+  directions = NULL
 )
 }
 \arguments{
@@ -32,6 +33,8 @@ sensitivity -- FOCEi's EBE gradient is unaffected and keeps the native
 path (issue #860; the nlm gap is tracked separately, matching how
 `.rxKeepMatExpNative()` already excludes SAEM from forcing models for
 its own reason).}
+
+\item{directions}{Optional names of solver coordinates to differentiate by.}
 }
 \value{
 the symengine environment `s` augmented with the sensitivity

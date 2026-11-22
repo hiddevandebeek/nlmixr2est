@@ -2222,14 +2222,18 @@ attr(rxUiGet.loadPrune, "rstudio") <- emptyenv()
 #'   path (issue #860; the nlm gap is tracked separately, matching how
 #'   `.rxKeepMatExpNative()` already excludes SAEM from forcing models for
 #'   its own reason).
+#' @param directions optional names of solver coordinates to differentiate by
 #' @return the symengine environment `s` augmented with the sensitivity
 #'   equations (`..sens`, `..ddt`, `..stateInfo`, ...)
 #' @author Matthew L. Fidler
 #' @export
 #' @keywords internal
-.sensEtaOrTheta <- function(s, theta = FALSE, extraThetaVars = NULL, rxui = NULL, matExpForcing = TRUE) {
+.sensEtaOrTheta <- function(s, theta = FALSE, extraThetaVars = NULL, rxui = NULL,
+                            matExpForcing = TRUE, directions = NULL) {
   .etaVars <- NULL
-  if (theta && exists("..maxTheta", s)) {
+  if (!is.null(directions)) {
+    .etaVars <- directions
+  } else if (theta && exists("..maxTheta", s)) {
     .etaVars <- paste0("THETA_", seq_len(s$..maxTheta), "_")
   } else if (exists("..maxEta", s)) {
     .etaVars <- paste0("ETA_", seq_len(s$..maxEta), "_")

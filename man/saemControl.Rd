@@ -14,6 +14,9 @@ saemControl(
   plateauMinFrac = 0.5,
   nmc = 3,
   nu = c(2, 2, 2),
+  malaStep = 0,
+  hmcStep = 0,
+  hmcSteps = 4L,
   rmcmc = 0.5,
   mcmcAcceptWarn = c(0.05, 0.8),
   print = 1L,
@@ -65,7 +68,7 @@ saemControl(
   mixProbPriorN = 20,
   mixSampleMethod = c("parallel", "msaem"),
   nonMuTheta = c("regress", "eta"),
-  nonMuThetaOpt = c("newuoa", "optimize", "nelderMead"),
+  nonMuThetaOpt = c("newuoa", "optimize", "nelderMead", "fisher"),
   nonMuThetaSweeps = 2L,
   nonMuThetaMaxEval = 25L,
   nonMuThetaTol = .Machine$double.eps^0.25,
@@ -110,21 +113,31 @@ you increase the number of chains the numerical integration by
 MC method will be more accurate at the cost of more
 computation.  In Monolix this is equivalent to \code{L}.}
 
-\item{nu}{This is a vector of 3 integers. They represent the
-    numbers of transitions of the three different kernels used in
-    the Hasting-Metropolis algorithm.  The default value is \code{c(2,2,2)},
-    representing 40 for each transition initially (each value is
-    multiplied by 20).  When unset, a residual error model that depends on
-    an eta uses \code{c(4,4,4)}, since its chains mix more slowly.
+\item{nu}{An unnamed vector of three counts, or a named integer vector
+    with entries \code{prior}, \code{rw}, \code{coord}, \code{mala}, and \code{hmc}.
+    Omitted standard counts default to two. The gradient counts give
+    transitions per iteration, including the first. They default to zero,
+    or one when a positive step size is supplied without an explicit count.
+    A positive gradient count with no step size uses 0.1.
+    The standard kernels run in order: population-prior independence
+    proposals, joint random-walk proposals, and coordinate random-walk
+    sweeps. Their counts are multiplied by 20 on the first iteration.
+    At least one kernel count must be positive. MALA and HMC run
+    afterward, in that order. A gradient-only schedule also samples any
+    auxiliary fixed-effect block that SAEM uses.}
 
-    The first value represents the initial number of multi-variate
-    Gibbs samples are taken from a normal distribution.
+\item{malaStep}{MALA step size in population-standardized random-effect coordinates.
+    The kernel uses the SAEM conditional observation likelihood and Gaussian
+    prior. It uses analytic sensitivities when the analytic score is supported
+    and central differences of the same target otherwise. It moves the unmasked
+    effects and reports counts in \code{fit$env$saem$malaCounts}.}
 
-    The second value represents the number of uni-variate, or multi-
-    dimensional random walk Gibbs samples are taken.
+\item{hmcStep}{HMC step size in population-standardized
+    coordinates.
+    Uses the same score routes as MALA. Pooled counts are available in
+    \code{fit$env$saem$hmcCounts}.}
 
-    The third value represents the number of bootstrap/reshuffling or
-    uni-dimensional random samples are taken.}
+\item{hmcSteps}{Number of leapfrog steps per HMC transition.}
 
 \item{rmcmc}{Scale of the random-walk proposals (kernels 2 and 3) relative
 to the current between-subject SD.  Smaller values raise the MCMC
@@ -547,7 +560,15 @@ golden-section `optimize()`.  When the non-mu thetas drive the ODE, every
 objective evaluation is a full re-solve, so this refinement can dominate the
 run time; the multivariate options spend a much smaller fixed budget and
 account for the coupling between coordinates that coordinate descent cannot
-see.}
+see. `"fisher"` jointly refines free non-mu structural thetas and residual
+residual parameters on the current SAEM draws and uses the E-step
+responsibilities for mixtures. It supports Gaussian residual models,
+including observation transformations and AR errors, and can optimize
+parameters of the model-provided general likelihood.
+It also supports residual-only refinement. When sensitivities are unavailable
+or Fisher scoring stalls, the existing bounded optimizer can continue on
+the same joint likelihood. Each optimizer has its own
+`nonMuThetaMaxEval` budget.}
 
 \item{nonMuThetaSweeps}{Number of coordinate-descent sweeps per refinement
 for `nonMuThetaOpt="optimize"` (default 2).}

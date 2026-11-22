@@ -75,7 +75,21 @@ attr(rxUiGet.saemCovars, "rstudio") <- "char"
 
 #' @export
 rxUiGet.saemFunctionModPredQuote <- function(x, ...) {
-  .mod <- .nlmixr2estRxode2(rxUiGet.saemModel(x, ...), "rxSaem", ui = x[[1]])
+  .text <- rxUiGet.saemModel(x, ...)
+  .compile <- function(text) {
+    if (isTRUE(attr(text, "saemEventJump"))) {
+      .nlmixr2estRxode2(text, "rxSaem", eventSens = "jump", ui = x[[1]])
+    } else {
+      .nlmixr2estRxode2(text, "rxSaem", ui = x[[1]])
+    }
+  }
+  .mod <- if (isTRUE(attr(.text, "saemHasScore"))) {
+    tryCatch(.compile(.text), error = function(e) {
+      .compile(rxUiGet.saemModel(x, ..., .buildScore = FALSE))
+    })
+  } else {
+    .compile(.text)
+  }
   .fnPred <- bquote(function(a, b, c) {
     rxode2::rxLoad(.(.mod))
     rxode2::rxLock(.(.mod))
@@ -114,8 +128,17 @@ rxUiGet.saemFunction <- function(x, ...) {
         .(.ui$saemParamsToEstimate),
         .(.penIni$name),
         .(.penIni$est),
-        .(.ui$saemOmegaTrans)
+        .(.ui$saemOmegaTrans),
+        .(.ui$saemResNames)
       )
+      if (.(identical(attr(.mod, "nlmixr2estEventSens"), "jump"))) {
+        if (isTRUE(tryCatch(rxode2::rxEventSensLoadModel(.(.mod)), error = function(e) FALSE))) {
+          on.exit(rxode2::rxEventSensDeactivate(), add = TRUE, after = FALSE)
+        } else {
+          a$optM$scoreLhs <- NULL
+          a$optM$phi0ScoreLhs <- NULL
+        }
+      }
       .ret <- .Call(`_nlmixr2est_saem_fit`, a, PACKAGE = "nlmixr2est")
       attr(.ret, "dopred") <- .(.fnPred)
       return(.ret)
@@ -151,6 +174,12 @@ rxUiGet.saemFunction <- function(x, ...) {
   attr(.fn, "nlhs") <- length(rxode2::rxLhs(.mod))
   attr(.fn, "nrhs") <- sum(.parmUpdate)
   attr(.fn, "paramUpdate") <- .parmUpdate
+  .lhs <- rxode2::rxLhs(.mod)
+  if (any(startsWith(.lhs, "rx_sg_"))) {
+    .scorePars <- rxUiGet.saemParamsToEstimateCov(x, ...)
+    .scoreNames <- setNames(paste0("rx_sg_", seq_along(.scorePars)), .scorePars)
+    attr(.fn, "scoreLhs") <- match(.scoreNames[.param[.parmUpdate == 1L]], .lhs) - 1L
+  }
   attr(.fn, "rx") <- .mod
   attr(.fn, "inPars") <- .inPars
   attr(.fn, "nendpnt") <- .nendpnt
